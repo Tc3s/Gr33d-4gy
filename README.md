@@ -1,205 +1,123 @@
-# agy-supervisor ⚡
+# agy-supervisor
 
-> **Production-Grade Multi-Account Quota Supervisor & Auto-Failover for Google Antigravity CLI (`agy`)**
+Multi-account quota supervisor and automatic session failover engine for Google Antigravity CLI (`agy`) on Linux.
 
-`agy-supervisor` là công cụ quản lý, giám sát và tự động xoay vòng hạn mức (quota) cho nhiều tài khoản Google Pro / Advanced trên Google Antigravity CLI trong **duy nhất 1 cửa sổ terminal**, bảo toàn 100% ngữ cảnh hội thoại, tự động bypass quyền thực thi (`--dangerously-skip-permissions`), và loại bỏ triệt để nguy cơ bị Google gắn cờ lạm dụng (Sybil & Abuse Detection).
-
----
-
-## 🌟 Tính Năng Cốt Lõi
-
-- **Duy Nhất 1 Terminal Session**: Tự động chuyển tài khoản trong vòng ~2-3 giây ngay khi tài khoản hiện tại hết quota. Không cần mở nhiều tab terminal, không cần đăng nhập lại qua trình duyệt giữa chừng.
-- **Bảo Toàn Ngữ Cảnh Cuộc Trò Chuyện 100%**: Cơ sở dữ liệu SQLite của Antigravity được lưu cục bộ (`~/.gemini/antigravity-cli/conversations/`). Khi xoay tài khoản, supervisor gọi `agy -c` nối tiếp chính xác luồng trao đổi mà không mất một bước lịch sử nào.
-- **Mặc Định YOLO Mode (`--dangerously-skip-permissions`)**: Tự động bảo đảm cờ bypass toàn bộ yêu cầu cấp quyền chạy lệnh bash hoặc sửa file, tối ưu cho developer / security researcher.
-- **Dynamic $N$-Account Scaling**: Không giới hạn 3 tài khoản. Bạn có thể mở rộng lên $N$ tài khoản ($1 \dots N$) thông qua lệnh `agy-supervisor add`.
-- **Đồng Bộ Hai Tầng Chuẩn Xác (Dual-Layer Sync)**:
-  - Tầng 1: Đồng bộ file hệ thống (`~/.gemini/oauth_creds.json`, `~/.gemini/google_accounts.json`).
-  - Tầng 2: Cập nhật in-place **GNOME Keyring (D-Bus Secret Service)** thông qua `SetSecret` và collection fallback (`/default` & `/collection/login`), giải quyết triệt để lỗi cache token ngầm của Linux desktop.
-- **100% Native TUI Responsiveness**: agy chạy trực tiếp trên foreground terminal TTY, không bị đóng băng hay trễ như các giải pháp PTY proxy/pipe. Hỗ trợ đầy đủ phím điều hướng, phím tắt, autocomplete, chuột và tự động thích ứng khi resize terminal.
-- **Engine Bắt Log Streaming Siêu Bền Vững (Line-Buffered Watcher)**:
-  - Xử lý triệt để cạm bẫy cắt đôi từ khóa (`RESOURCE_EXHAUSTED`) xuyên qua ranh giới chunk I/O (`line_buffer`).
-  - Tự động phát hiện và reset con trỏ offset khi file log bị truncate hoặc xoay vòng in-place (`cur_size < tracked_pos`).
-  - Bắt trọn vẹn cả HTTP 429 (`RESOURCE_EXHAUSTED`), gRPC Status 8 & 14, và HTTP 503 (`Model Overloaded / Service Unavailable`).
-- **Thang Thoát Tín Hiệu Chống Deadlock (Signal Escalation Ladder)**:
-  - Khi quota cạn kiệt, watcher thread gửi tín hiệu theo thang: `SIGINT` (chờ 2.5s) $\rightarrow$ `SIGTERM` (chờ 1.0s) $\rightarrow$ `SIGKILL`.
-  - Tránh hoàn toàn deadlock tại `proc.wait()` khi child process phớt lờ `SIGINT`.
-- **Ghi Đè Trạng Thái Nguyên Tử (Atomic State Writes)**:
-  - `supervisor_state.json` luôn được ghi ra `.tmp`, ép xả đĩa bằng `os.fsync()`, và thay thế nguyên tử bằng `os.replace()`, ngăn ngừa hỏng file khi mất nguồn hoặc ngắt đột ngột.
-- **Bảo Vệ Chống Bão Lỗi & Chống Ban Account (Anti-Abuse Engine)**:
-  - Giữ nguyên 1 `installation_id` cố định của máy trạm (tránh tạo dấu vết giả mạo phần cứng).
-  - Độ trễ chuyển giao an toàn $t_{\text{handover}} \ge 2.0\text{s}$ để bẻ gãy tương quan trên đồ thị phát hiện lạm dụng của Google.
-  - Lọc sạch toàn bộ log false-positive (`doRefreshQuota: skipped (throttled)`).
-  - **Master Circuit Breaker**: Tự động ngắt khi toàn bộ $N$ tài khoản đều cạn quota, đếm ngược chính xác đến **00:05 PST** (giờ reset quota của Google), hỗ trợ lệnh giải phóng `agy-supervisor reset`.
+Runs `agy` directly on the host foreground TTY, intercepts quota exhaustion in real time via streaming log evaluation, hot-swaps OAuth credentials across $N$ configured account slots (both file-level and D-Bus Secret Service), and resumes the exact conversation context via `agy -c` with `--dangerously-skip-permissions` enforced.
 
 ---
 
-## 🏗️ Kiến Trúc Hoạt Động
+## Architecture
 
 ```mermaid
-flowchart TD
-    subgraph Host["Terminal Của Bạn (/dev/pts/X)"]
-        User["Bàn phím & Màn hình (Direct TTY 0/1/2)"]
-    end
+sequenceDiagram
+    participant User as Terminal Host (Direct TTY)
+    participant Supervisor as agy-supervisor (Parent)
+    participant agy as agy CLI (BubbleTea TUI)
+    participant Watcher as Log Watcher (Daemon Thread)
+    participant Keyring as D-Bus Secret Service
 
-    subgraph Supervisor["agy-supervisor (Python Foreground Manager)"]
-        Guard["TerminalGuard (RAII tcgetattr / tcsetattr)"]
-        SigCtrl["Signal Isolator (SIGTERM/SIGHUP Forwarders)"]
-        StateMachine["Quota State Machine & Circuit Breaker"]
-        LogWatcher["Line-Buffered Log Watcher (Zero Chunk Slicing)"]
-        Escalator["Signal Escalator (SIGINT -> SIGTERM -> SIGKILL)"]
-        Keyring["D-Bus Secret Service (In-Place SetSecret)"]
-    end
+    Supervisor->>agy: spawn agy foreground (inherits stdin/stdout/stderr)
+    Supervisor->>Watcher: start line-buffered log watcher on cli.log
+    User<->agy: Native 0ms raw-mode interaction (vi-keys, autocomplete, mouse)
 
-    subgraph NativeChild["Phiên agy Trực Tiếp (Native Foreground)"]
-        BubbleTea["BubbleTea TUI (Native Raw Mode, Direct TTY 0/1/2)"]
-        Engine["Jetski Client Engine"]
+    alt Quota Exhaustion (429 / 503 / RESOURCE_EXHAUSTED)
+        Watcher->>Watcher: detect genuine quota & parse reset cooldown
+        Watcher->>agy: signal ladder: SIGINT (2.5s) -> SIGTERM (1.0s) -> SIGKILL
+        agy-->>Supervisor: exit (flushes SQLite WAL & releases presence lock)
+        Supervisor->>Keyring: in-place SetSecret + ~/.gemini sync (next slot)
+        Supervisor->>agy: spawn agy -c --dangerously-skip-permissions [args]
+        Note over User,agy: Session continues seamlessly on same terminal
     end
-
-    User <-->|Native 0ms Latency, Full Keybindings & Mouse| BubbleTea
-    LogWatcher -->|Line-buffered Parsing: 429 / 503 / RESOURCE_EXHAUSTED| StateMachine
-    StateMachine -->|1. Kích hoạt leo thang tín hiệu| Escalator
-    Escalator -->|Gửi SIGINT -> SIGTERM -> SIGKILL| BubbleTea
-    StateMachine -->|2. Check flock presence lock (TOCTOU-safe)| StateMachine
-    StateMachine -->|3. Anti-Abuse Gap >= 2.0s| StateMachine
-    StateMachine -->|4. Nạp Token + D-Bus In-Place + agy -c| Keyring
-    Keyring -->|Khởi chạy phiên mới với lịch sử SQLite| BubbleTea
 ```
 
 ---
 
-## 🚀 Cài Đặt Nhanh
+## Requirements & Installation
 
-### Yêu cầu hệ thống
-- Hệ điều hành: Linux (Ubuntu, Debian, Kali, Arch, Fedora...).
-- Python 3.8+ (khuyên dùng Python 3.10+).
-- Module D-Bus cho Python:
-  - Ubuntu/Debian/Kali: `sudo apt-get install python3-dbus`
-  - Arch Linux: `sudo pacman -S python-dbus`
-  - Fedora/RHEL: `sudo dnf install python3-dbus`
-- Đã cài đặt Antigravity CLI (`agy`).
+### Requirements
+- Linux (x86_64 / aarch64)
+- Python 3.8+
+- D-Bus Python bindings (`python3-dbus`)
+- Antigravity CLI (`agy`) installed and available in `$PATH`
 
-### Lệnh cài đặt 1 dòng
+### Installation
 ```bash
 git clone https://github.com/your-username/agy-supervisor.git
 cd agy-supervisor
-./install.sh
+./install.sh -y
 ```
-File thực thi sẽ được cài vào `~/.local/bin/agy-supervisor` và tự động thêm alias `agys` vào `~/.bashrc` / `~/.zshrc`.
+
+Binary is installed to `~/.local/bin/agy-supervisor` with alias `agys` added to `~/.bashrc` / `~/.zshrc`.
 
 ---
 
-## 📖 Hướng Dẫn Sử Dụng
+## CLI Reference
 
-### 1. Thiết lập các Tài khoản Google (Chỉ làm 1 lần)
-
-* **Xem danh sách slot hiện tại**:
-  ```bash
-  agy-supervisor status
-  ```
-
-* **Lưu tài khoản hiện tại vào Slot 1**:
-  Nếu bạn đang đăng nhập sẵn một tài khoản trên `agy`:
-  ```bash
-  agy-supervisor save 1
-  ```
-
-* **Thêm tài khoản mới (Slot 2, Slot 3, Slot $N+1$)**:
-  ```bash
-  agy-supervisor add
-  # hoặc chỉ định slot cụ thể:
-  agy-supervisor login 2
-  agy-supervisor login 3
-  ```
-  1. Trình duyệt sẽ mở ra trang xác thực OAuth của Google.
-  2. Đăng nhập tài khoản Google Pro mới.
-  3. Khi giao diện `agy` xuất hiện trên terminal, gõ `/exit` (hoặc bấm `Ctrl+D`).
-  4. Tool sẽ tự động bắt token và lưu vĩnh viễn vào slot tương ứng.
-
-* **Hoặc dùng Wizard tương tác tự động**:
-  ```bash
-  agy-supervisor setup
-  ```
-
----
-
-### 2. Khởi Động Làm Việc Hàng Ngày
-
-Chỉ cần gõ:
-```bash
-agy-supervisor
-# hoặc dùng alias viết tắt:
-agys
-```
-
-Bạn có thể truyền bất kỳ tham số nào của `agy`, ví dụ:
-```bash
-agy-supervisor --model gemini-2.5-pro --effort high
-```
-
-* **Trải nghiệm**:
-  - Bạn tương tác trực tiếp với giao diện TUI như bình thường. Mọi yêu cầu cấp quyền đều được auto-approve (`--dangerously-skip-permissions`).
-  - Khi Tài khoản 1 hết quota, màn hình thông báo:
-    ```text
-    [!] Hết quota ở Slot 1 (user1@gmail.com). Đang kiểm tra xoay tua...
-    [+] Tự động chuyển sang Slot 2 (user2@gmail.com). Nối tiếp phiên chat...
-    ```
-  - Phiên làm việc tự động nối tiếp (`agy -c`) trong tích tắc, giữ nguyên toàn bộ lịch sử hội thoại và ngữ cảnh.
-
----
-
-### 3. Bảng Lệnh CLI Đầy Đủ
-
-| Lệnh | Chức năng |
+| Command | Description |
 | :--- | :--- |
-| `agy-supervisor [args...]` | Khởi chạy agy với auto-failover & bypass permissions |
-| `agy-supervisor status` | Xem bảng trạng thái tất cả slot, email và thời gian reset quota |
-| `agy-supervisor reset [all\|<N>]` | Reset trạng thái cooldown quota của các slot về `ACTIVE` |
-| `agy-supervisor add` | Tự động tạo Slot $N+1$ và mở trình duyệt để nạp thêm tài khoản |
-| `agy-supervisor login <N>` | Đăng nhập tài khoản cho Slot $N$ |
-| `agy-supervisor switch <N>` | Chuyển ngay lập tức sang Slot $N$ trong 0.1s |
-| `agy-supervisor save <N>` | Lưu token đang active trong `~/.gemini` vào Slot $N$ |
-| `agy-supervisor setup` | Trình wizard tương tác thiết lập nhanh toàn bộ tài khoản |
+| `agy-supervisor [args...]` | Launch foreground session with auto-failover and `--dangerously-skip-permissions` |
+| `agy-supervisor status` | Display status table of all configured slots, active slot, and cooldown timers |
+| `agy-supervisor add` | Create Slot $N+1$ and launch OAuth login flow |
+| `agy-supervisor login <N>` | Authenticate or re-authenticate Google account for Slot $N$ |
+| `agy-supervisor switch <N>` | Hot-swap active credentials to Slot $N$ immediately |
+| `agy-supervisor save <N>` | Snapshot active credentials from `~/.gemini/` into Slot $N$ |
+| `agy-supervisor reset [all\|<N>]` | Clear quota cooldown status and mark slots `ACTIVE` |
+| `agy-supervisor setup` | Interactive wizard to inspect and configure all account slots |
 
 ---
 
-### 4. Công Cụ Tự Động Hóa & Kiểm Thử (Makefile)
+## Technical Specifications
 
-Repository được trang bị bộ công cụ kiểm thử và chẩn đoán toàn diện:
+### 1. Direct Foreground TTY Execution
+- Spawns `agy` with inherited standard file descriptors (`fd 0, 1, 2`).
+- Bypasses PTY proxying latency, raw-mode cursor corruption, and terminal resize desynchronization (`SIGWINCH`).
+- `TerminalGuard` context manager restores normal screen buffer (`\x1b[?1049l`) and cursor visibility (`\x1b[?25h`) on any exit or exception.
+
+### 2. Dual-Layer Credential Synchronization
+- **Filesystem**: Mirrors `oauth_creds.json` and `google_accounts.json` into `~/.gemini_accounts/<slot>/` with `0600` permissions.
+- **GNOME Keyring (D-Bus Secret Service)**: Directly queries `org.freedesktop.secrets`, updates secret in-place via `item.SetSecret(...)` if present, or creates item under collection `/aliases/default` (fallback `/collection/login`). Prevents credential leaking and stale keyring reads.
+
+### 3. Line-Buffered Log Stream Watcher
+- Reads `cli.log` incrementally using partial line buffering (`line_buffer = lines.pop()`).
+- Eliminates chunk-boundary splitting false negatives where keywords (e.g., `RESOURCE_EXHAUSTED`) span across read buffers.
+- Distinguishes genuine quota events from concurrent background logs (e.g. `doRefreshQuota: skipped (throttled)` written 50ms apart by Go goroutines).
+- Automatically resets read offset to 0 if the log file is truncated in-place (`cur_size < tracked_pos`).
+
+### 4. Deterministic Signal Escalation
+- To prevent main-thread deadlocks at `proc.wait()`, the watcher thread implements a progressive escalation ladder:
+  $$\text{SIGINT (2.5s)} \longrightarrow \text{SIGTERM (1.0s)} \longrightarrow \text{SIGKILL}$$
+- Registers `SIGTERM` and `SIGHUP` handlers in the supervisor to cleanly terminate child processes and prevent orphaned instances.
+
+### 5. Atomic State Persistence
+- All updates to `supervisor_state.json` write to a temporary file (`.tmp`), call `os.fsync()`, and perform an atomic POSIX replace (`os.replace()`) to prevent state corruption during sudden shutdowns.
+
+---
+
+## Development & Diagnostics
+
+The repository includes a comprehensive verification suite:
 
 ```bash
-# 1. Chạy bộ kiểm thử hồi quy & edge-case (17 test cases bao phủ toàn bộ các tầng)
+# Run regression test suite (17 unit & integration tests)
 make test
 
-# 2. Kiểm tra sức khỏe hệ thống, D-Bus session, và hạn dùng token
+# Perform environment, permission, and token validity audit
 make health
 
-# 3. Chạy kiểm chứng thực tế quá trình xoay tua & nối tiếp phiên chat trên hệ thống thật
+# Run deterministic live quota failover simulation on the system
 make verify
 ```
 
 ---
 
-## 🔒 Tại Sao Giải Pháp Này Không Bị Google Ban?
+## Documentation
 
-| Nguy cơ bị Google gắn cờ | Cơ chế bảo vệ của `agy-supervisor` |
-| :--- | :--- |
-| **Bị coi là bot farm do random `installation_id`** | Giữ nguyên **1 `installation_id` duy nhất** của máy trạm. Google hiểu đây là 1 máy tính hợp lệ của developer chứa nhiều profile. |
-| **Bị Sybil Detection phát hiện lách quota ($t < 50\text{ms}$)** | Enforce độ trễ chuyển giao an toàn $t \ge 2.0\text{s}$, mô phỏng hành vi đổi profile tự nhiên của con người. |
-| **Bão lỗi 4xx (4xx Thrashing Storm)** | **Master Circuit Breaker** tự động ngắt khi toàn bộ $N$ tài khoản cạn quota, đếm ngược đến 00:05 PST, tuyệt đối không spam request lỗi. |
-| **Xung đột token & Desync** | Tự động sync ngược refresh token mới nhất về slot khi đổi tài khoản, bảo vệ phiên làm việc lâu dài. |
-| **Bỏ sót lỗi sập node (503 / UNAVAILABLE)** | Nhận diện lỗi máy chủ quá tải để xoay tua sang tài khoản trên phân vùng khác thay vì treo vô hạn. |
-
-Chi tiết xem tại tài liệu chuyên sâu: [docs/ANTI_ABUSE_GUIDE.md](docs/ANTI_ABUSE_GUIDE.md).
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Detailed analysis of Linux TTY execution, signal ladders, D-Bus Secret Service, and SQLite WAL mechanics.
+- [docs/ANTI_ABUSE_GUIDE.md](docs/ANTI_ABUSE_GUIDE.md): Technical analysis of Google rate limiters, Pacific Midnight reset intervals, and evasion prevention.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): Remediation steps for Circuit Breaker trips, headless SSH sessions, and presence lock conflicts.
 
 ---
 
-## 📚 Tài Liệu Kỹ Thuật Chuyên Sâu
+## License
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Phân tích chi tiết kiến trúc nhân Linux, Direct Foreground TUI, Signal Escalation Ladder, Line-Buffered Log Watcher, D-Bus Secret Service và SQLite WAL.
-- [docs/ANTI_ABUSE_GUIDE.md](docs/ANTI_ABUSE_GUIDE.md): Nghiên cứu chuyên sâu về hệ thống chống gian lận quota của Google (RPM/RPD, SybilRank, JA4 Fingerprint).
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): Các lỗi thường gặp (Circuit Breaker, Headless/SSH D-Bus, Presence Locks, Buffer Corruption) và cách khắc phục triệt để.
-
----
-
-## 📄 Bản Quyền
-Phát hành theo giấy phép [MIT License](LICENSE).
+[MIT](LICENSE)
