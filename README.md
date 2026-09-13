@@ -10,22 +10,23 @@ Runs `agy` directly on the host foreground TTY, intercepts quota exhaustion in r
 
 ```mermaid
 sequenceDiagram
-    participant User as Terminal Host (Direct TTY)
-    participant Supervisor as agy-supervisor (Parent)
+    autonumber
+    actor User as Terminal Host (Direct TTY)
+    participant Supervisor as agy-supervisor
     participant agy as agy CLI (BubbleTea TUI)
-    participant Watcher as Log Watcher (Daemon Thread)
+    participant Watcher as Log Watcher Thread
     participant Keyring as D-Bus Secret Service
 
     Supervisor->>agy: spawn agy foreground (inherits stdin/stdout/stderr)
     Supervisor->>Watcher: start line-buffered log watcher on cli.log
-    User<->agy: Native 0ms raw-mode interaction (vi-keys, autocomplete, mouse)
+    Note over User,agy: Native 0ms raw-mode interaction (vi-keys, autocomplete, mouse)
 
     alt Quota Exhaustion (429 / 503 / RESOURCE_EXHAUSTED)
         Watcher->>Watcher: detect genuine quota & parse reset cooldown
-        Watcher->>agy: signal ladder: SIGINT (2.5s) -> SIGTERM (1.0s) -> SIGKILL
+        Watcher->>agy: send SIGINT (graceful shutdown)
         agy-->>Supervisor: exit (flushes SQLite WAL & releases presence lock)
-        Supervisor->>Keyring: in-place SetSecret + ~/.gemini sync (next slot)
-        Supervisor->>agy: spawn agy -c --dangerously-skip-permissions [args]
+        Supervisor->>Keyring: in-place SetSecret & ~/.gemini credential swap
+        Supervisor->>agy: spawn agy -c --dangerously-skip-permissions
         Note over User,agy: Session continues seamlessly on same terminal
     end
 ```
@@ -98,7 +99,7 @@ Binary is installed to `~/.local/bin/agy-supervisor` with alias `agys` added to 
 The repository includes a comprehensive verification suite:
 
 ```bash
-# Run regression test suite (17 unit & integration tests)
+# Run regression test suite (19 unit & integration tests)
 make test
 
 # Perform environment, permission, and token validity audit

@@ -10,7 +10,7 @@ help:
 	@echo "  agy-supervisor Developer & Admin Automation Tools"
 	@echo "======================================================================"
 	@echo "Available targets:"
-	@echo "  make test        - Run the regression and edge-case test suite (17 tests)"
+	@echo "  make test        - Run the regression and edge-case test suite (19 tests)"
 	@echo "  make health      - Run environment and credential health check audit"
 	@echo "  make verify      - Run live deterministic quota failover PoC simulation"
 	@echo "  make install     - Install binary to ~/.local/bin/ and setup bash alias"
