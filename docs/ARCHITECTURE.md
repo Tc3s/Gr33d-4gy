@@ -4,46 +4,53 @@ Tài liệu này phân tích chi tiết cấu trúc kỹ thuật tầng thấp (
 
 ---
 
-## 1. Vấn Đề Nhân Linux & Terminal Emulation (PTY Master/Slave)
+## 1. Vấn Đề Nhân Linux & Terminal Execution Model
 
-### Hạn chế khi chạy TUI trong Bash Script thông thường
+### Hạn chế chết người của việc bọc TUI qua PTY Proxy hoặc Script thông thường
 Antigravity CLI (`agy`) sử dụng framework giao diện TUI **BubbleTea** (viết bằng Go). Khi BubbleTea khởi động:
 1. Nó đưa terminal vào chế độ **Raw Mode**: xóa các cờ `ICANON` (không chờ Enter mới đọc), `ECHO` (không tự in ký tự gõ), và `OPOST` (xử lý output thủ công).
 2. Nó phát chuỗi ANSI **`\x1b[?1049h` (`smcup`)** để chuyển toàn bộ màn hình sang Alternate Screen Buffer, và **`\x1b[?25l`** để ẩn con trỏ chuột.
 
-Nếu dùng một script Bash thông thường để bọc `agy`:
-* **Lỗi `SIGTTIN` / `SIGTTOU`**: Khi chạy `agy &` trong background, nhân Linux phân loại tiến trình vào một Background Process Group. Bất kỳ lệnh `read()` nào từ terminal sẽ khiến tty line discipline của Linux gửi tín hiệu **`SIGTTIN`**, dừng tiến trình ngay lập tức. Bất kỳ lệnh `tcsetattr()` nào cũng gửi **`SIGTTOU`**, làm đóng băng ứng dụng.
-* **Lỗi Terminal Corrupted**: Nếu gửi `kill -TERM` trực tiếp đến `agy`, tiến trình bị ép dừng trước khi hàm dọn dẹp `p.RestoreTerminal()` của BubbleTea kịp chạy. Kết quả là terminal của người dùng bị kẹt ở Alternate Screen, mất con trỏ, mất echo, và các ký tự xuống dòng bị lệch hình bậc thang.
+Khi xây dựng trình giám sát (Supervisor), có hai cạm bẫy kinh điển trong lập trình hệ thống Linux:
+* **Cạm bẫy PTY Proxy thiếu raw mode**: Nếu mở một PTY master/slave nhưng không đặt `sys.stdin` của tiến trình cha vào raw mode (`tty.setraw()`), driver TTY của hệ điều hành vẫn ở chế độ canonical (cooked mode). Toàn bộ phím gõ, phím mũi tên điều hướng, phím tắt, autocomplete sẽ bị đóng băng hoặc in ra ký tự rác (`^[[A`) cho đến khi người dùng bấm Enter. Ngoài ra, việc dùng vòng lặp `select.select()` ở tiến trình cha tạo ra độ trễ (latency) và dễ bị lỗi desync kích thước màn hình (SIGWINCH).
+* **Cạm bẫy Background Process Group (`SIGTTIN` / `SIGTTOU`)**: Nếu chạy `agy &` trong background bằng script thông thường, nhân Linux sẽ gửi tín hiệu **`SIGTTIN`** hoặc **`SIGTTOU`**, lập tức dừng tiến trình.
 
-### Giải pháp PTY Master/Slave trong `agy-supervisor`
-`agy-supervisor` sử dụng mô hình Pseudo-Terminal chuẩn POSIX thông qua module `pty` của Python:
+### Kiến Trúc Tối Ưu: Direct Foreground Execution + Daemon Log Watcher
+`agy-supervisor` triển khai mô hình thực thi trực tiếp trên Foreground TTY kết hợp luồng giám sát ngầm:
 
 ```mermaid
 sequenceDiagram
-    participant User as Terminal Host (Stdin/Stdout)
-    participant Supervisor as PTY Master (agy-supervisor)
-    participant Kernel as Linux PTY Driver (/dev/pts/X)
-    participant agy as PTY Slave (agy BubbleTea)
+    participant User as Terminal Host (/dev/pts/X)
+    participant Supervisor as agy-supervisor (Parent Process)
+    participant agy as agy CLI (BubbleTea Child)
+    participant Watcher as Log Watcher (Daemon Thread)
+    participant Log as cli.log (~/.gemini/.../cli.log)
 
-    Supervisor->>Kernel: pty.openpty() -> master_fd, slave_fd
-    Supervisor->>agy: fork()
-    Note over agy: os.setsid()<br/>ioctl(slave_fd, TIOCSCTTY)<br/>dup2(slave_fd, 0, 1, 2)
-    agy->>agy: execvp("agy", ["agy", "--dangerously-skip-permissions", ...])
-    Note over agy: agy chạy như Foreground Session Leader<br/>Hoàn toàn không bị SIGTTIN / SIGTTOU!
+    Supervisor->>Supervisor: wait_for_presence_lock_release()
+    Supervisor->>Supervisor: signal.signal(SIGINT, SIG_IGN) (Bảo vệ cha khỏi Ctrl+C)
+    Supervisor->>agy: subprocess.Popen(["agy", "--dangerously-skip-permissions", ...])
+    Note over agy, User: agy thừa hưởng trực tiếp stdin, stdout, stderr (fd 0, 1, 2)<br/>BubbleTea điều khiển 100% Native TTY: 0ms lag, chuẩn ANSI, vi-mode, chuột & autocomplete mượt mà!
     
-    loop Multiplexing I/O
-        User->>Supervisor: Gõ phím / Paste
-        Supervisor->>Kernel: write(master_fd, input)
-        Kernel->>agy: deliver to stdin
-        agy->>Kernel: render TUI output
-        Kernel->>Supervisor: read(master_fd)
-        Supervisor->>User: write(stdout, data)
+    Supervisor->>Watcher: Khởi chạy luồng theo dõi cli.log (Daemon)
+    
+    rect rgb(240, 240, 240)
+        Note over User, agy: Người dùng tương tác trực tiếp với agy CLI bình thường
+        User->>agy: Gõ lệnh, mũi tên, phím tắt
+        agy->>User: Render TUI trực tiếp lên màn hình
+        agy->>Log: Ghi log hoạt động / API responses
     end
 
-    Note over User, Supervisor: Window Resize (SIGWINCH)
-    User->>Supervisor: SIGWINCH
-    Supervisor->>Kernel: ioctl(master_fd, TIOCSWINSZ, winsize)
-    Kernel->>agy: SIGWINCH delivered, TUI re-renders!
+    alt Phát hiện Quota Exhausted (HTTP 429 / RESOURCE_EXHAUSTED)
+        Log->>Watcher: Chunk: "(RESOURCE_EXHAUSTED (code 429): Individual quota reached... Resets in 4h46m23s.)"
+        Watcher->>Watcher: is_genuine_quota_log() -> True, parse_reset_seconds() -> 17183s
+        Watcher->>agy: proc.send_signal(SIGINT)
+        Note over agy: agy nhận SIGINT: commit SQLite WAL, nhả lock, dừng an toàn
+        agy-->>Supervisor: proc.wait() hoàn tất
+        Supervisor->>Supervisor: mark_exhausted(curr_slot, reset_secs)
+        Supervisor->>Supervisor: rotate_to_next() (Apply token & D-Bus Keyring Slot mới)
+        Supervisor->>User: Thông báo: "[+] Tự động chuyển sang Slot 2. Nối tiếp phiên chat..."
+        Supervisor->>agy: Khởi chạy lại agy với cờ: ["-c", "--dangerously-skip-permissions"]
+    end
 ```
 
 #### Bảo vệ trạng thái Terminal bằng RAII (`TerminalGuard`)

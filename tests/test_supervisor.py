@@ -41,6 +41,18 @@ class TestQuotaDetection(unittest.TestCase):
         log_sample = b"Backend returned status code: 429 Too Many Requests"
         self.assertTrue(mod.is_genuine_quota_log(log_sample))
 
+    def test_real_world_individual_quota_log(self):
+        """Test the exact real-world log produced by agy on quota exhaustion."""
+        log_sample = b"I0910 23:20:23.541207 28527 run.go:387] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h46m23s.), retrying in 4s"
+        self.assertTrue(mod.is_genuine_quota_log(log_sample))
+
+    def test_parse_reset_seconds(self):
+        self.assertEqual(mod.parse_reset_seconds("Resets in 4h46m23s."), 17183)
+        self.assertEqual(mod.parse_reset_seconds("Resets in 107h19m2s."), 386342)
+        self.assertEqual(mod.parse_reset_seconds("Resets in 30m."), 1800)
+        self.assertEqual(mod.parse_reset_seconds("Resets in 45s."), 45)
+        self.assertEqual(mod.parse_reset_seconds("No reset string"), 0)
+
 class TestAccountManagerLogic(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -49,14 +61,18 @@ class TestAccountManagerLogic(unittest.TestCase):
         # Override ACCOUNTS_DIR in mod
         self.orig_dir = mod.ACCOUNTS_DIR
         self.orig_state = mod.STATE_FILE
+        self.orig_sleep = mod.time.sleep
         mod.ACCOUNTS_DIR = self.accounts_dir
         mod.STATE_FILE = self.accounts_dir / "supervisor_state.json"
+        # Mock time.sleep to run tests instantly
+        mod.time.sleep = lambda s: None
         
         self.mgr = mod.AccountManager()
 
     def tearDown(self):
         mod.ACCOUNTS_DIR = self.orig_dir
         mod.STATE_FILE = self.orig_state
+        mod.time.sleep = self.orig_sleep
         self.temp_dir.cleanup()
 
     def test_dynamic_slot_discovery(self):

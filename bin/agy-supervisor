@@ -25,6 +25,9 @@ import select
 import datetime
 import zoneinfo
 import base64
+import subprocess
+import threading
+import re
 from pathlib import Path
 
 # Base Paths
@@ -43,8 +46,9 @@ TRUE_TERMINAL_QUOTA_PATTERNS = [
 ]
 
 FALSE_POSITIVE_PATTERNS = [
-    b"doRefreshQuota: skipped (throttled)",
-    b"starting reload (force=false)"
+    b"doRefreshQuota: skipped",
+    b"starting reload",
+    b"exhausted iterator",
 ]
 
 # D-Bus Keyring Helper Functions (for GNOME Keyring / Secret Service)
@@ -135,6 +139,9 @@ def is_genuine_quota_log(chunk: bytes) -> bool:
     if b"You have exhausted your quota on this model" in chunk:
         return True
     if b"RESOURCE_EXHAUSTED" in chunk and (
+        b"quota reached" in chunk or
+        b"code 429" in chunk or
+        b"429" in chunk or
         b"backend request" in chunk or 
         b"grpc" in chunk or 
         b"ConnectRPC" in chunk or 
@@ -146,7 +153,20 @@ def is_genuine_quota_log(chunk: bytes) -> bool:
         return True
     if b"model capacity exhausted" in chunk:
         return True
+    if b"image generation quota exceeded" in chunk:
+        return True
     return False
+
+def parse_reset_seconds(text: str) -> int:
+    m = re.search(r"Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text)
+    if m:
+        h = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        s = int(m.group(3) or 0)
+        total = h * 3600 + mins * 60 + s
+        if total > 0:
+            return total
+    return 0
 
 def extract_email_from_path(slot_path: Path) -> str:
     # 1. Try google_accounts.json
@@ -312,9 +332,12 @@ class AccountManager:
         )
         return int(midnight.timestamp())
 
-    def mark_exhausted(self, slot: str, is_daily: bool = True):
+    def mark_exhausted(self, slot: str, reset_secs: int = 0, is_daily: bool = True):
         now = int(time.time())
-        until = self.calculate_midnight_pacific() if is_daily else now + 60
+        if reset_secs > 0:
+            until = now + reset_secs
+        else:
+            until = self.calculate_midnight_pacific() if is_daily else now + 60
         if "slots" not in self.state:
             self.state["slots"] = {}
         self.state["slots"][str(slot)] = {
@@ -379,11 +402,15 @@ class AccountManager:
         self.apply_slot(next_slot)
         return next_slot
 
-class PTYSupervisor:
+class ProcessSupervisor:
+    """
+    Direct foreground execution supervisor with background log watcher.
+    Guarantees 100% native TUI responsiveness (no PTY buffering/echo/hang issues)
+    while reliably intercepting quota events in real time.
+    """
     def __init__(self, account_mgr: AccountManager):
         self.account_mgr = account_mgr
-        self.child_pid = None
-        self.master_fd = None
+        self.child_process = None
 
     def wait_for_presence_lock_release(self, timeout=3.0) -> bool:
         start = time.time()
@@ -403,19 +430,12 @@ class PTYSupervisor:
             time.sleep(0.1)
         return False
 
-    def forward_window_size(self):
-        if sys.stdin.isatty() and self.master_fd:
-            try:
-                winsize = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
-                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-            except Exception:
-                pass
-
-    def run_session(self, user_args, is_continue=False) -> bool:
-        """Runs agy in PTY. Returns True if quota triggered rotation, False on clean exit."""
+    def run_session(self, user_args, is_continue=False) -> tuple:
+        """
+        Runs agy in direct foreground execution.
+        Returns: (quota_detected: bool, reset_seconds: int)
+        """
         self.wait_for_presence_lock_release()
-        master_fd, slave_fd = pty.openpty()
-        self.master_fd = master_fd
 
         cmd = ["agy"]
         if is_continue:
@@ -425,113 +445,117 @@ class PTYSupervisor:
         if "--dangerously-skip-permissions" not in user_args:
             cmd.append("--dangerously-skip-permissions")
 
-        cmd.extend(user_args)
+        # If continuing session, avoid duplicating one-time prompts while preserving flags
+        if is_continue:
+            filtered_args = []
+            skip_next = False
+            for i, arg in enumerate(user_args):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in ["-c", "--continue", "--dangerously-skip-permissions"]:
+                    continue
+                if arg in ["--model", "--effort", "--agent", "--project"]:
+                    filtered_args.append(arg)
+                    if i + 1 < len(user_args):
+                        filtered_args.append(user_args[i + 1])
+                        skip_next = True
+                    continue
+                if arg.startswith("--"):
+                    filtered_args.append(arg)
+                    continue
+            cmd.extend(filtered_args)
+        else:
+            cmd.extend(user_args)
 
-        pid = os.fork()
-        if pid == 0:
-            try:
-                os.close(master_fd)
-                os.setsid()
-                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-                os.dup2(slave_fd, 0)
-                os.dup2(slave_fd, 1)
-                os.dup2(slave_fd, 2)
-                if slave_fd > 2:
-                    os.close(slave_fd)
-                os.execvp("agy", cmd)
-            except Exception as e:
-                sys.stderr.write(f"Failed to exec agy: {e}\n")
-            finally:
-                sys.exit(1)
+        quota_detected = threading.Event()
+        quota_reset_secs = [0]
+        stop_watcher = threading.Event()
 
-        os.close(slave_fd)
-        self.child_pid = pid
-        self.forward_window_size()
+        def log_watcher(proc: subprocess.Popen):
+            tracked_file = None
+            tracked_pos = 0
 
-        old_sigwinch = signal.signal(signal.SIGWINCH, lambda s, f: self.forward_window_size())
-
-        quota_detected = False
-        log_file = None
-        log_pos = 0
-
-        try:
-            while True:
-                if log_file is None or not os.path.exists(log_file):
-                    symlink = CLI_DIR / "cli.log"
-                    if symlink.exists():
-                        try:
-                            resolved = str(symlink.resolve())
-                            if os.path.exists(resolved):
-                                log_file = resolved
-                                log_pos = os.path.getsize(log_file)
-                        except OSError:
-                            pass
-
-                if log_file and os.path.exists(log_file):
-                    try:
-                        cur_size = os.path.getsize(log_file)
-                        if cur_size > log_pos:
-                            with open(log_file, "rb") as lf:
-                                lf.seek(log_pos)
-                                chunk = lf.read(cur_size - log_pos)
-                                log_pos = cur_size
-                                if is_genuine_quota_log(chunk):
-                                    quota_detected = True
-                                    break
-                    except OSError:
-                        pass
-
-                r, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [], 0.05)
-                
-                if sys.stdin.fileno() in r:
-                    try:
-                        data = os.read(sys.stdin.fileno(), 1024)
-                        if not data:
-                            break
-                        os.write(master_fd, data)
-                    except OSError:
-                        break
-
-                if master_fd in r:
-                    try:
-                        data = os.read(master_fd, 4096)
-                        if not data:
-                            break
-                        if any(tp in data for tp in TRUE_TERMINAL_QUOTA_PATTERNS):
-                            quota_detected = True
-                            os.write(sys.stdout.fileno(), data)
-                            break
-                        os.write(sys.stdout.fileno(), data)
-                    except OSError:
-                        break
-
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    break
-
-        finally:
-            signal.signal(signal.SIGWINCH, old_sigwinch)
-            if quota_detected:
+            symlink = CLI_DIR / "cli.log"
+            if symlink.exists():
                 try:
-                    os.kill(pid, signal.SIGINT)
+                    resolved = symlink.resolve()
+                    if resolved.exists():
+                        tracked_file = resolved
+                        tracked_pos = resolved.stat().st_size
+                except OSError:
+                    pass
+
+            while not stop_watcher.is_set() and proc.poll() is None:
+                try:
+                    if symlink.exists():
+                        resolved = symlink.resolve()
+                        if tracked_file is None or resolved != tracked_file:
+                            tracked_file = resolved
+                            tracked_pos = 0
+
+                    if tracked_file and tracked_file.exists():
+                        cur_size = tracked_file.stat().st_size
+                        if cur_size > tracked_pos:
+                            with open(tracked_file, "rb") as lf:
+                                lf.seek(tracked_pos)
+                                chunk = lf.read(cur_size - tracked_pos)
+                                tracked_pos = cur_size
+                                if is_genuine_quota_log(chunk):
+                                    quota_detected.set()
+                                    try:
+                                        text = chunk.decode("utf-8", errors="ignore")
+                                        quota_reset_secs[0] = parse_reset_seconds(text)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        proc.send_signal(signal.SIGINT)
+                                    except OSError:
+                                        pass
+                                    break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+        # Launch agy directly in the foreground (inherits real tty stdin, stdout, stderr)
+        try:
+            proc = subprocess.Popen(cmd)
+            self.child_process = proc
+        except Exception as e:
+            sys.stderr.write(f"\r\n\033[1;31m[!] Lỗi khởi chạy 'agy': {e}\033[0m\r\n")
+            return False, 0
+
+        watcher_thread = threading.Thread(target=log_watcher, args=(proc,), daemon=True)
+        watcher_thread.start()
+
+        # Ignore SIGINT in supervisor so Ctrl+C in agy cancels prompt instead of killing supervisor
+        old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            proc.wait()
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+            stop_watcher.set()
+            watcher_thread.join(timeout=0.5)
+
+        if quota_detected.is_set():
+            if proc.poll() is None:
+                try:
+                    proc.send_signal(signal.SIGINT)
                     for _ in range(20):
-                        wpid, status = os.waitpid(pid, os.WNOHANG)
-                        if wpid == pid:
+                        if proc.poll() is not None:
                             break
                         time.sleep(0.1)
                     else:
-                        os.kill(pid, signal.SIGTERM)
+                        proc.terminate()
                         time.sleep(0.5)
-                        os.kill(pid, signal.SIGKILL)
+                        if proc.poll() is None:
+                            proc.kill()
                 except OSError:
                     pass
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
 
-        return quota_detected
+        return quota_detected.is_set(), quota_reset_secs[0]
+
+PTYSupervisor = ProcessSupervisor
 
 # Subcommand Handlers
 
@@ -741,12 +765,12 @@ def main():
 
     with TerminalGuard() as guard:
         while True:
-            supervisor = PTYSupervisor(mgr)
-            quota_hit = supervisor.run_session(user_args, is_continue=is_continue)
+            supervisor = ProcessSupervisor(mgr)
+            quota_hit, reset_secs = supervisor.run_session(user_args, is_continue=is_continue)
 
             if quota_hit:
                 curr_slot = mgr.get_current_slot()
-                mgr.mark_exhausted(curr_slot, is_daily=True)
+                mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
                 next_slot = mgr.rotate_to_next()
                 if not next_slot:
                     sys.exit(0)

@@ -13,7 +13,7 @@
 - **Mặc định YOLO Mode (`--dangerously-skip-permissions`)**: Tự động chèn cờ bypass toàn bộ yêu cầu cấp quyền chạy lệnh bash hoặc sửa file, tối ưu cho developer / security researcher.
 - **Dynamic $N$-Account Scaling**: Không giới hạn 3 tài khoản. Bạn có thể mở rộng lên $N$ tài khoản ($1 \dots N$) thông qua lệnh `agy-supervisor add`.
 - **Đồng Bộ Hai Tầng (Dual-Layer Sync)**: Đồng bộ cả file hệ thống (`~/.gemini/oauth_creds.json`, `~/.gemini/google_accounts.json`) và **GNOME Keyring (D-Bus Secret Service)**, giải quyết triệt để lỗi cache token ngầm của Linux desktop.
-- **Kiến Trúc PTY Master/Slave Chuẩn Linux**: Chạy `agy` trong một Pseudo-Terminal ảo riêng biệt. Miễn nhiễm 100% với lỗi `SIGTTIN`/`SIGTTOU`, tự động co giãn theo kích thước màn hình (`SIGWINCH`), và dùng RAII để đảm bảo terminal luôn sạch sẽ, không bị kẹt hay mất chữ.
+- **100% Native TUI Responsiveness**: agy chạy trực tiếp trên foreground terminal TTY, không bị đóng băng hay lag như các giải pháp PTY proxy/pipe thông thường. Hỗ trợ toàn diện phím điều hướng, phím tắt, autocomplete, chuột và tự động thích ứng khi resize terminal.
 - **Chống Bão Lỗi & Chống Ban Account (Anti-Abuse Engine)**:
   - Giữ nguyên 1 `installation_id` cố định của máy trạm (tránh tạo dấu vết giả mạo phần cứng).
   - Độ trễ chuyển giao an toàn $t_{\text{handover}} \ge 2.0\text{s}$ để bẻ gãy tương quan trên đồ thị phát hiện lạm dụng của Google.
@@ -26,26 +26,24 @@
 
 ```mermaid
 flowchart TD
-    subgraph Host["Terminal Của Bạn"]
+    subgraph Host["Terminal Của Bạn (/dev/pts/X)"]
         User["Bàn phím & Màn hình"]
     end
 
-    subgraph Supervisor["agy-supervisor (Python PTY Master)"]
-        RAII["TerminalGuard (RAII tcgetattr / tcsetattr)"]
-        Multiplex["select.select() I/O Multiplexer"]
-        Winch["SIGWINCH Forwarder (TIOCSWINSZ)"]
+    subgraph Supervisor["agy-supervisor (Python Foreground Manager)"]
+        Guard["TerminalGuard (RAII tcgetattr / tcsetattr)"]
+        SigCtrl["Signal Isolator (Bảo vệ cha khỏi Ctrl+C)"]
         StateMachine["Quota State Machine & Circuit Breaker"]
-        LogWatcher["Dynamic Log Follower (Filter False-Positives)"]
+        LogWatcher["Daemon Log Watcher (Filter False-Positives)"]
     end
 
-    subgraph Child["Phiên agy (PTY Slave - Setsid Foreground)"]
-        BubbleTea["BubbleTea TUI (Raw Mode, rmcup/smcup)"]
+    subgraph NativeChild["Phiên agy Trực Tiếp (Native Foreground)"]
+        BubbleTea["BubbleTea TUI (Native Raw Mode, Direct TTY 0/1/2)"]
         Engine["Jetski Client Engine"]
     end
 
-    User <--> RAII <--> Multiplex
-    Multiplex <-->|master_fd| BubbleTea
-    LogWatcher -->|Bắt 429 / RESOURCE_EXHAUSTED| StateMachine
+    User <-->|Native 0ms Latency, Full Keybindings & Autocomplete| BubbleTea
+    LogWatcher -->|Bắt 429 / RESOURCE_EXHAUSTED trong cli.log| StateMachine
     StateMachine -->|1. Gửi SIGINT graceful| BubbleTea
     StateMachine -->|2. Check flock presence lock| StateMachine
     StateMachine -->|3. Anti-Abuse Delay >= 2.0s| StateMachine
