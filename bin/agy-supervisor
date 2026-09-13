@@ -55,12 +55,24 @@ FALSE_POSITIVE_PATTERNS = [
 try:
     import dbus
 
+    def _get_keyring_collection(bus):
+        for path in ["/org/freedesktop/secrets/aliases/default", "/org/freedesktop/secrets/collection/login"]:
+            try:
+                obj = bus.get_object("org.freedesktop.secrets", path)
+                col = dbus.Interface(obj, "org.freedesktop.Secret.Collection")
+                col.Get("org.freedesktop.Secret.Collection", "Label", dbus_interface="org.freedesktop.DBus.Properties")
+                return obj, col
+            except Exception:
+                continue
+        return None, None
+
     def get_keyring_item(bus=None):
         try:
             if bus is None:
                 bus = dbus.SessionBus()
-            obj = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets/aliases/default")
-            col = dbus.Interface(obj, "org.freedesktop.Secret.Collection")
+            obj, col = _get_keyring_collection(bus)
+            if not col:
+                return None
             items = col.Get("org.freedesktop.Secret.Collection", "Items", dbus_interface="org.freedesktop.DBus.Properties")
             for item_path in items:
                 item_obj = bus.get_object("org.freedesktop.secrets", item_path)
@@ -92,8 +104,22 @@ try:
             svc_iface = dbus.Interface(service, "org.freedesktop.Secret.Service")
             session_path = svc_iface.OpenSession("plain", "")[1]
 
-            obj = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets/aliases/default")
-            col = dbus.Interface(obj, "org.freedesktop.Secret.Collection")
+            secret_bytes = secret_str.encode("utf-8")
+            secret_struct = dbus.Struct((
+                session_path,
+                dbus.Array([], signature="y"),
+                dbus.ByteArray(secret_bytes),
+                dbus.String("text/plain")
+            ), signature="oayays")
+
+            existing_item = get_keyring_item(bus)
+            if existing_item:
+                existing_item.SetSecret(secret_struct, dbus_interface="org.freedesktop.Secret.Item")
+                return True
+
+            obj, col = _get_keyring_collection(bus)
+            if not col:
+                return False
 
             props = dbus.Dictionary({
                 "org.freedesktop.Secret.Item.Label": dbus.String("Password for 'antigravity' on 'gemini'"),
@@ -102,14 +128,6 @@ try:
                     "username": "antigravity"
                 }, signature="ss")
             }, signature="sv")
-
-            secret_bytes = secret_str.encode("utf-8")
-            secret_struct = dbus.Struct((
-                session_path,
-                dbus.Array([], signature="y"),
-                dbus.ByteArray(secret_bytes),
-                dbus.String("text/plain")
-            ), signature="oayays")
 
             col.CreateItem(props, secret_struct, True)
             return True
@@ -138,32 +156,26 @@ def is_genuine_quota_log(chunk: bytes) -> bool:
             continue
         if b"You have exhausted your quota on this model" in line:
             return True
-        if b"RESOURCE_EXHAUSTED" in line and (
-            b"quota reached" in line or
-            b"code 429" in line or
-            b"429" in line or
-            b"backend request" in line or 
-            b"grpc" in line or 
-            b"ConnectRPC" in line or 
-            b"CloudCode" in line or 
-            b"JetskiService" in line
-        ):
+        if b"RESOURCE_EXHAUSTED" in line:
             return True
         if b"status code: 429" in line or b'"code": 429' in line:
             return True
-        if b"model capacity exhausted" in line:
+        if b"model capacity exhausted" in line or b"image generation quota exceeded" in line:
             return True
-        if b"image generation quota exceeded" in line:
+        if b"503" in line and (b"Service Unavailable" in line or b"Overloaded" in line or b"overloaded" in line):
+            return True
+        if b"code = Unavailable" in line or (b"UNAVAILABLE" in line and b"14" in line):
             return True
     return False
 
 def parse_reset_seconds(text: str) -> int:
-    m = re.search(r"Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text)
-    if m:
-        h = int(m.group(1) or 0)
-        mins = int(m.group(2) or 0)
-        s = int(m.group(3) or 0)
-        total = h * 3600 + mins * 60 + s
+    m = re.search(r"Resets in (?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", text)
+    if m and any(m.groups()):
+        d = int(m.group(1) or 0)
+        h = int(m.group(2) or 0)
+        mins = int(m.group(3) or 0)
+        s = int(m.group(4) or 0)
+        total = d * 86400 + h * 3600 + mins * 60 + s
         if total > 0:
             return total
     return 0
@@ -236,8 +248,9 @@ class TerminalGuard:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.orig_termios)
             except Exception:
                 pass
-        sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\r\n")
-        sys.stdout.flush()
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\r\n")
+            sys.stdout.flush()
 
 class AccountManager:
     def __init__(self):
@@ -248,6 +261,10 @@ class AccountManager:
 
     def ensure_dirs(self):
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.accounts_dir, 0o700)
+        except OSError:
+            pass
 
     def get_all_slots(self) -> list:
         """Dynamically discovers all numeric slots in ~/.gemini_accounts/."""
@@ -274,8 +291,20 @@ class AccountManager:
         }
 
     def save_state(self):
-        with open(self.state_file, "w") as f:
-            json.dump(self.state, f, indent=2)
+        tmp_file = self.state_file.with_suffix(".tmp")
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(self.state, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp_file, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_file, self.state_file)
+        except Exception:
+            with open(self.state_file, "w") as f:
+                json.dump(self.state, f, indent=2)
 
     def get_current_slot(self) -> str:
         return str(self.state.get("current_slot", 1))
@@ -284,16 +313,30 @@ class AccountManager:
         slot = self.get_current_slot()
         slot_dir = self.accounts_dir / slot
         slot_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(slot_dir, 0o700)
+        except OSError:
+            pass
         for fname in ["oauth_creds.json", "google_accounts.json"]:
             src = GEMINI_DIR / fname
+            dst = slot_dir / fname
             if src.exists():
-                with open(src, "rb") as f_in, open(slot_dir / fname, "wb") as f_out:
+                with open(src, "rb") as f_in, open(dst, "wb") as f_out:
                     f_out.write(f_in.read())
+                try:
+                    os.chmod(dst, 0o600)
+                except OSError:
+                    pass
         # Sync keyring secret
         sec = get_keyring_secret()
         if sec:
-            with open(slot_dir / "keyring_secret.json", "w") as f:
+            dst_sec = slot_dir / "keyring_secret.json"
+            with open(dst_sec, "w") as f:
                 f.write(sec)
+            try:
+                os.chmod(dst_sec, 0o600)
+            except OSError:
+                pass
 
     def apply_slot(self, slot: str) -> bool:
         slot_dir = self.accounts_dir / str(slot)
@@ -325,11 +368,13 @@ class AccountManager:
         return True
 
     def calculate_midnight_pacific(self) -> int:
-        tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+        try:
+            tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+        except Exception:
+            tz = datetime.timezone(datetime.timedelta(hours=-8))
         now = datetime.datetime.now(tz)
-        midnight = (now + datetime.timedelta(days=1)).replace(
-            hour=0, minute=5, second=0, microsecond=0
-        )
+        tomorrow_date = now.date() + datetime.timedelta(days=1)
+        midnight = datetime.datetime.combine(tomorrow_date, datetime.time(0, 5, 0), tzinfo=tz)
         return int(midnight.timestamp())
 
     def mark_exhausted(self, slot: str, reset_secs: int = 0, is_daily: bool = True):
@@ -349,7 +394,10 @@ class AccountManager:
     def rotate_to_next(self) -> str:
         self.sync_back_current()
         now = int(time.time())
-        curr = int(self.get_current_slot())
+        try:
+            curr = int(self.get_current_slot())
+        except (ValueError, TypeError):
+            curr = 1
         
         # Discover all valid configured slots dynamically
         all_slots = [
@@ -371,10 +419,15 @@ class AccountManager:
         ]
 
         # Refresh state for recovered slots
+        state_modified = False
         for s in available:
             slot_key = str(s)
             if slot_key in self.state.get("slots", {}):
-                self.state["slots"][slot_key]["status"] = "ACTIVE"
+                if self.state["slots"][slot_key].get("status") != "ACTIVE":
+                    self.state["slots"][slot_key]["status"] = "ACTIVE"
+                    state_modified = True
+        if state_modified:
+            self.save_state()
 
         if not available:
             # Circuit breaker: ALL configured accounts are exhausted
@@ -432,9 +485,13 @@ class ProcessSupervisor:
                         with open(lock_file, "r") as f:
                             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                    except (BlockingIOError, OSError):
+                    except FileNotFoundError:
+                        continue
+                    except (BlockingIOError, PermissionError):
                         locked = True
                         break
+                    except OSError:
+                        pass
             if not locked:
                 return True
             time.sleep(0.1)
@@ -450,12 +507,9 @@ class ProcessSupervisor:
         cmd = ["agy"]
         if is_continue:
             cmd.append("-c")
+        cmd.append("--dangerously-skip-permissions")
 
-        # ALWAYS guarantee --dangerously-skip-permissions is included
-        if "--dangerously-skip-permissions" not in user_args:
-            cmd.append("--dangerously-skip-permissions")
-
-        # If continuing session, avoid duplicating one-time prompts while preserving flags
+        # If continuing session, avoid duplicating one-time prompts while preserving runtime flags
         if is_continue:
             filtered_args = []
             skip_next = False
@@ -465,18 +519,28 @@ class ProcessSupervisor:
                     continue
                 if arg in ["-c", "--continue", "--dangerously-skip-permissions"]:
                     continue
-                if arg in ["--model", "--effort", "--agent", "--project"]:
+                # Skip one-time prompt invocations in continue mode
+                if arg in ["-p", "--print", "--prompt", "-i", "--prompt-interactive"]:
+                    if i + 1 < len(user_args) and not user_args[i + 1].startswith("-"):
+                        skip_next = True
+                    continue
+                if arg.startswith("-p=") or arg.startswith("--print=") or arg.startswith("--prompt="):
+                    continue
+                # Preserve session runtime options with values
+                if arg in ["--model", "-m", "--effort", "-e", "--agent", "-a", "--project", "--mode", "--add-dir", "--conversation"]:
                     filtered_args.append(arg)
-                    if i + 1 < len(user_args):
+                    if i + 1 < len(user_args) and not user_args[i + 1].startswith("-"):
                         filtered_args.append(user_args[i + 1])
                         skip_next = True
                     continue
-                if arg.startswith("--"):
+                if arg.startswith("-"):
                     filtered_args.append(arg)
                     continue
             cmd.extend(filtered_args)
         else:
-            cmd.extend(user_args)
+            for arg in user_args:
+                if arg != "--dangerously-skip-permissions":
+                    cmd.append(arg)
 
         quota_detected = threading.Event()
         quota_reset_secs = [0]
@@ -485,6 +549,7 @@ class ProcessSupervisor:
         def log_watcher(proc: subprocess.Popen):
             tracked_file = None
             tracked_pos = 0
+            line_buffer = b""
 
             symlink = CLI_DIR / "cli.log"
             if symlink.exists():
@@ -503,29 +568,55 @@ class ProcessSupervisor:
                         if tracked_file is None or resolved != tracked_file:
                             tracked_file = resolved
                             tracked_pos = 0
+                            line_buffer = b""
 
                     if tracked_file and tracked_file.exists():
                         cur_size = tracked_file.stat().st_size
+                        if cur_size < tracked_pos:
+                            tracked_pos = 0
+                            line_buffer = b""
+
                         if cur_size > tracked_pos:
                             with open(tracked_file, "rb") as lf:
                                 lf.seek(tracked_pos)
-                                chunk = lf.read(cur_size - tracked_pos)
+                                new_bytes = lf.read(cur_size - tracked_pos)
                                 tracked_pos = cur_size
-                                if is_genuine_quota_log(chunk):
-                                    quota_detected.set()
-                                    try:
-                                        text = chunk.decode("utf-8", errors="ignore")
-                                        quota_reset_secs[0] = parse_reset_seconds(text)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        proc.send_signal(signal.SIGINT)
-                                    except OSError:
-                                        pass
+
+                                content = line_buffer + new_bytes
+                                lines = content.split(b"\n")
+                                line_buffer = lines.pop()
+
+                                for line in lines:
+                                    if is_genuine_quota_log(line):
+                                        quota_detected.set()
+                                        try:
+                                            text = line.decode("utf-8", errors="ignore")
+                                            quota_reset_secs[0] = parse_reset_seconds(text)
+                                        except Exception:
+                                            pass
+                                        # Escalate termination in watcher to prevent proc.wait() deadlock
+                                        try:
+                                            proc.send_signal(signal.SIGINT)
+                                            for _ in range(25):
+                                                if proc.poll() is not None:
+                                                    break
+                                                time.sleep(0.1)
+                                            else:
+                                                proc.terminate()
+                                                for _ in range(10):
+                                                    if proc.poll() is not None:
+                                                        break
+                                                    time.sleep(0.1)
+                                                else:
+                                                    proc.kill()
+                                        except OSError:
+                                            pass
+                                        break
+                                if quota_detected.is_set():
                                     break
                 except Exception:
                     pass
-                time.sleep(0.1)
+                time.sleep(0.05)
 
         # Launch agy directly in the foreground (inherits real tty stdin, stdout, stderr)
         try:
@@ -538,30 +629,26 @@ class ProcessSupervisor:
         watcher_thread = threading.Thread(target=log_watcher, args=(proc,), daemon=True)
         watcher_thread.start()
 
-        # Ignore SIGINT in supervisor so Ctrl+C in agy cancels prompt instead of killing supervisor
+        # Setup termination signal forwarder to avoid orphan processes
+        def handle_term_signal(signum, frame):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            sys.exit(0)
+
+        old_sigterm = signal.signal(signal.SIGTERM, handle_term_signal)
+        old_sighup = signal.signal(signal.SIGHUP, handle_term_signal)
         old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         try:
             proc.wait()
         finally:
             signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
+            signal.signal(signal.SIGHUP, old_sighup)
             stop_watcher.set()
             watcher_thread.join(timeout=0.5)
-
-        if quota_detected.is_set():
-            if proc.poll() is None:
-                try:
-                    proc.send_signal(signal.SIGINT)
-                    for _ in range(20):
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.1)
-                    else:
-                        proc.terminate()
-                        time.sleep(0.5)
-                        if proc.poll() is None:
-                            proc.kill()
-                except OSError:
-                    pass
 
         return quota_detected.is_set(), quota_reset_secs[0]
 

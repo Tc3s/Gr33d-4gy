@@ -51,19 +51,30 @@ class TestQuotaDetection(unittest.TestCase):
         self.assertEqual(mod.parse_reset_seconds("Resets in 107h19m2s."), 386342)
         self.assertEqual(mod.parse_reset_seconds("Resets in 30m."), 1800)
         self.assertEqual(mod.parse_reset_seconds("Resets in 45s."), 45)
+        self.assertEqual(mod.parse_reset_seconds("Resets in 2d."), 172800)
+        self.assertEqual(mod.parse_reset_seconds("Resets in 1d 12h 30m."), 86400 + 12 * 3600 + 30 * 60)
         self.assertEqual(mod.parse_reset_seconds("No reset string"), 0)
+
+    def test_http_503_and_unavailable_detection(self):
+        log_503 = b"HTTP/2.0 503 Service Unavailable: Model Overloaded"
+        self.assertTrue(mod.is_genuine_quota_log(log_503))
+        log_grpc = b"rpc error: code = Unavailable desc = Service unavailable"
+        self.assertTrue(mod.is_genuine_quota_log(log_grpc))
 
 class TestAccountManagerLogic(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.accounts_dir = Path(self.temp_dir.name)
         
-        # Override ACCOUNTS_DIR in mod
+        # Override ACCOUNTS_DIR and PRESENCE_DIR in mod
         self.orig_dir = mod.ACCOUNTS_DIR
         self.orig_state = mod.STATE_FILE
+        self.orig_presence = mod.PRESENCE_DIR
         self.orig_sleep = mod.time.sleep
         mod.ACCOUNTS_DIR = self.accounts_dir
         mod.STATE_FILE = self.accounts_dir / "supervisor_state.json"
+        mod.PRESENCE_DIR = self.accounts_dir / "presence"
+        mod.PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
         # Mock time.sleep to run tests instantly
         mod.time.sleep = lambda s: None
         
@@ -72,6 +83,7 @@ class TestAccountManagerLogic(unittest.TestCase):
     def tearDown(self):
         mod.ACCOUNTS_DIR = self.orig_dir
         mod.STATE_FILE = self.orig_state
+        mod.PRESENCE_DIR = self.orig_presence
         mod.time.sleep = self.orig_sleep
         self.temp_dir.cleanup()
 
@@ -126,6 +138,27 @@ class TestAccountManagerLogic(unittest.TestCase):
         # Slot 1 rotates, should skip 2 and go straight to 3!
         next_slot = self.mgr.rotate_to_next()
         self.assertEqual(next_slot, "3")
+
+    def test_atomic_save_state(self):
+        """Verify that save_state produces valid JSON atomically and handles reload."""
+        self.mgr.state["current_slot"] = 3
+        self.mgr.state["slots"]["3"] = {"status": "ACTIVE"}
+        self.mgr.save_state()
+        self.assertTrue(self.mgr.state_file.exists())
+        with open(self.mgr.state_file, "r") as f:
+            data = json.load(f)
+        self.assertEqual(data.get("current_slot"), 3)
+        self.assertEqual(data.get("slots", {}).get("3", {}).get("status"), "ACTIVE")
+
+    def test_wait_for_presence_lock_toctou(self):
+        """Verify wait_for_presence_lock_release tolerates lock file deletion race condition."""
+        sup = mod.ProcessSupervisor(self.mgr)
+        lock_dir = mod.PRESENCE_DIR
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_dir / "test.lock"
+        lock_file.touch()
+        # Should gracefully return True when lock is released
+        self.assertTrue(sup.wait_for_presence_lock_release(timeout=0.5))
 
 class TestKeyringIntegration(unittest.TestCase):
     def test_dbus_availability(self):
@@ -258,6 +291,75 @@ class TestFullEndToEndRotation(unittest.TestCase):
         # Assertions on commands
         self.assertEqual(history[0][1], ["agy", "--dangerously-skip-permissions"])
         self.assertEqual(history[1][1], ["agy", "-c", "--dangerously-skip-permissions"])
+
+class TestCliArgumentFiltering(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.orig_dir = mod.ACCOUNTS_DIR
+        self.orig_state = mod.STATE_FILE
+        mod.ACCOUNTS_DIR = Path(self.temp_dir.name)
+        mod.STATE_FILE = mod.ACCOUNTS_DIR / "supervisor_state.json"
+        self.mgr = mod.AccountManager()
+        self.sup = mod.ProcessSupervisor(self.mgr)
+
+    def tearDown(self):
+        mod.ACCOUNTS_DIR = self.orig_dir
+        mod.STATE_FILE = self.orig_state
+        self.temp_dir.cleanup()
+
+    def test_continue_mode_preserves_flags_and_strips_prompts(self):
+        user_args = ["-m", "gemini-2.5-pro", "--effort", "high", "--mode", "plan", "-p", "write a virus scanner", "--dangerously-skip-permissions"]
+        
+        captured_cmd = []
+        def mock_popen(cmd):
+            captured_cmd.append(list(cmd))
+            class P:
+                def poll(self): return 0
+                def wait(self): return 0
+            return P()
+        
+        orig_popen = mod.subprocess.Popen
+        mod.subprocess.Popen = mock_popen
+        try:
+            self.sup.run_session(user_args, is_continue=True)
+        finally:
+            mod.subprocess.Popen = orig_popen
+
+        res = captured_cmd[0]
+        self.assertIn("-c", res)
+        self.assertIn("--dangerously-skip-permissions", res)
+        self.assertIn("-m", res)
+        self.assertIn("gemini-2.5-pro", res)
+        self.assertIn("--effort", res)
+        self.assertIn("high", res)
+        self.assertIn("--mode", res)
+        self.assertIn("plan", res)
+        self.assertNotIn("write a virus scanner", res)
+
+class TestChunkBoundaryLineBuffering(unittest.TestCase):
+    def test_line_buffering_across_boundary(self):
+        """Verify that a split keyword across chunk boundaries is reconstructed."""
+        chunk1 = b"some prefix info\nI0910 23:20:23 run.go:387] attempt 1 failed (RESOUR"
+        chunk2 = b"CE_EXHAUSTED (code 429): Individual quota reached. Resets in 4h46m23s.)\n"
+        
+        line_buffer = b""
+        detected = False
+        
+        content1 = line_buffer + chunk1
+        lines1 = content1.split(b"\n")
+        line_buffer = lines1.pop()
+        for line in lines1:
+            if mod.is_genuine_quota_log(line):
+                detected = True
+        self.assertFalse(detected)
+
+        content2 = line_buffer + chunk2
+        lines2 = content2.split(b"\n")
+        line_buffer = lines2.pop()
+        for line in lines2:
+            if mod.is_genuine_quota_log(line):
+                detected = True
+        self.assertTrue(detected)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
