@@ -7,8 +7,9 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 
-# Credentials & Tokens (CRITICAL: NEVER COMMIT SECRETS)
+# Credentials, Keys & Secrets (CRITICAL: NEVER COMMIT SECRETS)
 *.json
 !tests/mock_*.json
 oauth_creds.json
@@ -16,8 +17,31 @@ google_accounts.json
 keyring_secret.json
 supervisor_state.json
 .gemini_accounts/
+gemini_accounts/
 tokens/
 creds/
+credentials/
+accounts/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.token
+*.jwt
+*.secret
+
+# Environment & Configs
+.env
+.env.*
+!.env.example
+
+# SQLite & Databases
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
 
 # Logs & Run-time data
 *.log
@@ -27,7 +51,9 @@ creds/
 htmlcov/
 .pytest_cache/
 
-# OS artifacts
+# OS and Editor artifacts
 .DS_Store
 *.swp
 *~
+.idea/
+.vscode/

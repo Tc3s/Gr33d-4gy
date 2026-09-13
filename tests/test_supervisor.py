@@ -193,7 +193,7 @@ class TestFullEndToEndRotation(unittest.TestCase):
 
         for s in [1, 2]:
             (mod.ACCOUNTS_DIR / str(s)).mkdir(parents=True)
-            (mod.ACCOUNTS_DIR / str(s) / "oauth_creds.json").write_text("{\"email\": \"acc" + str(s) + "@gmail.com\"}")
+            (mod.ACCOUNTS_DIR / str(s) / "oauth_creds.json").write_text("{\"email\": \"acc" + str(s) + "@example.com\"}")
 
         self.mgr = mod.AccountManager()
         self.mgr.apply_slot("1")

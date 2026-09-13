@@ -12,9 +12,9 @@ Tài liệu giải quyết các tình huống lỗi thường gặp khi sử d�
   ======================================================================
   [!] CIRCUIT BREAKER: Toàn bộ 3 tài khoản khả dụng đều đã cạn quota!
   [*] Cooldown ngắn nhất còn lại: khoảng 4 giờ 20 phút nữa.
-      - Slot 1 (user1@gmail.com): chờ 4h 20m
-      - Slot 2 (user2@gmail.com): chờ 4h 20m
-      - Slot 3 (user3@gmail.com): chờ 4h 20m
+      - Slot 1 (user1@example.com): chờ 4h 20m
+      - Slot 2 (user2@example.com): chờ 4h 20m
+      - Slot 3 (user3@example.com): chờ 4h 20m
   💡 Muốn nạp thêm tài khoản mới: agy-supervisor add
   💡 Nếu tài khoản đã có lại quota và muốn reset cooldown: agy-supervisor reset
   ======================================================================
