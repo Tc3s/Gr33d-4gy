@@ -126,48 +126,97 @@ def audit_account_slots():
         s_dir = accounts_dir / str(s)
         oauth_file = s_dir / "oauth_creds.json"
         keyring_file = s_dir / "keyring_secret.json"
+        google_acc_file = s_dir / "google_accounts.json"
 
         email = "Unknown"
         token_status = "NOT_FOUND"
         exp_info = "-"
 
-        if oauth_file.exists():
-            # Check permission
-            st = oauth_file.stat()
-            mode = oct(st.st_mode & 0o777)
-            perm_ok = (st.st_mode & 0o077) == 0
+        # 1. Resolve email from google_accounts.json
+        if google_acc_file.exists():
+            try:
+                with open(google_acc_file, "r") as f:
+                    ga = json.load(f)
+                    if ga.get("active"):
+                        email = str(ga["active"])
+            except Exception:
+                pass
 
+        # 2. Read oauth_creds.json if present
+        creds = {}
+        if oauth_file.exists():
             try:
                 with open(oauth_file, "r") as f:
                     creds = json.load(f)
-                id_token = creds.get("id_token", "")
-                if "." in id_token:
-                    parts = id_token.split(".")
-                    payload = parts[1]
-                    rem = len(payload) % 4
-                    if rem:
-                        payload += "=" * (4 - rem)
-                    claims = json.loads(base64.urlsafe_b64decode(payload))
-                    email = claims.get("email", "Unknown")
-                    exp = claims.get("exp", 0)
-                    if exp:
-                        exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                        if exp < now:
-                            exp_info = f"EXPIRED ({exp_dt})"
-                            token_status = "EXPIRED"
-                        else:
-                            rem_mins = int((exp - now) // 60)
-                            exp_info = f"Valid for {rem_mins}m ({exp_dt})"
-                            token_status = "ACTIVE"
-                elif creds.get("refresh_token"):
-                    token_status = "ACTIVE (Refresh token present)"
             except Exception as e:
                 token_status = f"ERROR ({e})"
+
+        # 3. Read keyring_secret.json if present
+        sec_creds = {}
+        if keyring_file.exists():
+            try:
+                with open(keyring_file, "r") as f:
+                    sec_creds = json.load(f)
+            except Exception:
+                pass
+
+        # Fallback email extraction from JWT id_token
+        if email == "Unknown":
+            for c in (creds, sec_creds):
+                idt = c.get("id_token", "") if isinstance(c, dict) else ""
+                if "." in idt:
+                    try:
+                        parts = idt.split(".")
+                        payload = parts[1]
+                        rem = len(payload) % 4
+                        if rem:
+                            payload += "=" * (4 - rem)
+                        claims = json.loads(base64.urlsafe_b64decode(payload))
+                        em = claims.get("email")
+                        if em:
+                            email = em
+                            break
+                    except Exception:
+                        pass
+
+        # Check OAuth token & refreshability status
+        active_dict = creds if creds else sec_creds
+        has_refresh = bool((isinstance(creds, dict) and creds.get("refresh_token")) or 
+                           (isinstance(sec_creds, dict) and sec_creds.get("refresh_token")))
+        id_token = active_dict.get("id_token", "") if isinstance(active_dict, dict) else ""
+
+        if "." in id_token:
+            try:
+                parts = id_token.split(".")
+                payload = parts[1]
+                rem = len(payload) % 4
+                if rem:
+                    payload += "=" * (4 - rem)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                exp = claims.get("exp", 0)
+                if exp:
+                    exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if exp < now:
+                        if has_refresh:
+                            token_status = "ACTIVE (Refreshable)"
+                            exp_info = f"Access token expired ({exp_dt}) - refresh token ready"
+                        else:
+                            token_status = "EXPIRED"
+                            exp_info = f"EXPIRED ({exp_dt}) - no refresh token"
+                    else:
+                        rem_mins = int((exp - now) // 60)
+                        token_status = "ACTIVE"
+                        exp_info = f"Valid for {rem_mins}m ({exp_dt})"
+            except Exception as e:
+                token_status = f"ERROR ({e})"
+        elif has_refresh:
+            token_status = "ACTIVE (Refresh token present)"
+            exp_info = "Refresh token present"
         elif keyring_file.exists():
             token_status = "KEYRING_ONLY"
 
         has_keyring = "Yes" if keyring_file.exists() else "No"
-        status_flag = "PASS" if token_status in ["ACTIVE", "KEYRING_ONLY"] or "Refresh token" in token_status else "WARN"
+        status_flag = "PASS" if token_status.startswith("ACTIVE") or token_status == "KEYRING_ONLY" else "WARN"
         report_item(f"Slot {s}", f"Slot {s} ({email})", status_flag, f"Status: {token_status} | Keyring: {has_keyring} | {exp_info}")
 
 def main():

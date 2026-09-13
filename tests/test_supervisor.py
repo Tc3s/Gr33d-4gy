@@ -66,15 +66,20 @@ class TestAccountManagerLogic(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.accounts_dir = Path(self.temp_dir.name)
         
-        # Override ACCOUNTS_DIR and PRESENCE_DIR in mod
+        # Override ACCOUNTS_DIR, PRESENCE_DIR, and GEMINI_DIR in mod
         self.orig_dir = mod.ACCOUNTS_DIR
         self.orig_state = mod.STATE_FILE
         self.orig_presence = mod.PRESENCE_DIR
+        self.orig_gemini = mod.GEMINI_DIR
+        self.orig_set_keyring = mod.set_keyring_secret
         self.orig_sleep = mod.time.sleep
         mod.ACCOUNTS_DIR = self.accounts_dir
         mod.STATE_FILE = self.accounts_dir / "supervisor_state.json"
         mod.PRESENCE_DIR = self.accounts_dir / "presence"
         mod.PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
+        mod.GEMINI_DIR = self.accounts_dir / "gemini"
+        mod.GEMINI_DIR.mkdir(parents=True, exist_ok=True)
+        mod.set_keyring_secret = lambda s: True
         # Mock time.sleep to run tests instantly
         mod.time.sleep = lambda s: None
         
@@ -84,6 +89,8 @@ class TestAccountManagerLogic(unittest.TestCase):
         mod.ACCOUNTS_DIR = self.orig_dir
         mod.STATE_FILE = self.orig_state
         mod.PRESENCE_DIR = self.orig_presence
+        mod.GEMINI_DIR = self.orig_gemini
+        mod.set_keyring_secret = self.orig_set_keyring
         mod.time.sleep = self.orig_sleep
         self.temp_dir.cleanup()
 
@@ -150,6 +157,43 @@ class TestAccountManagerLogic(unittest.TestCase):
         self.assertEqual(data.get("current_slot"), 3)
         self.assertEqual(data.get("slots", {}).get("3", {}).get("status"), "ACTIVE")
 
+    def test_sync_back_preserves_valid_slot_when_gemini_corrupt(self):
+        """Verify sync_back_current refuses to overwrite stored slot creds if ~/.gemini/ is corrupted or empty."""
+        slot1_dir = self.accounts_dir / "1"
+        slot1_dir.mkdir(parents=True, exist_ok=True)
+        valid_creds = {"access_token": "valid_acc", "refresh_token": "valid_ref"}
+        (slot1_dir / "oauth_creds.json").write_text(json.dumps(valid_creds))
+
+        self.mgr.state["current_slot"] = 1
+        self.mgr.save_state()
+
+        # Case 1: Corrupt non-JSON data in GEMINI_DIR
+        (mod.GEMINI_DIR / "oauth_creds.json").write_text("{CORRUPT_JSON_DATA!@#")
+        self.mgr.sync_back_current()
+        self.assertEqual(json.loads((slot1_dir / "oauth_creds.json").read_text()), valid_creds)
+
+        # Case 2: Empty dict without token fields
+        (mod.GEMINI_DIR / "oauth_creds.json").write_text("{}")
+        self.mgr.sync_back_current()
+        self.assertEqual(json.loads((slot1_dir / "oauth_creds.json").read_text()), valid_creds)
+
+    def test_sync_back_updates_when_gemini_valid(self):
+        """Verify sync_back_current updates slot credentials when valid new tokens are present."""
+        slot1_dir = self.accounts_dir / "1"
+        slot1_dir.mkdir(parents=True, exist_ok=True)
+        initial_creds = {"access_token": "old_acc", "refresh_token": "valid_ref"}
+        (slot1_dir / "oauth_creds.json").write_text(json.dumps(initial_creds))
+
+        self.mgr.state["current_slot"] = 1
+        self.mgr.save_state()
+
+        # Valid refreshed token in GEMINI_DIR
+        refreshed_creds = {"access_token": "new_refreshed_acc", "refresh_token": "valid_ref"}
+        (mod.GEMINI_DIR / "oauth_creds.json").write_text(json.dumps(refreshed_creds))
+        self.mgr.sync_back_current()
+
+        self.assertEqual(json.loads((slot1_dir / "oauth_creds.json").read_text()), refreshed_creds)
+
     def test_wait_for_presence_lock_toctou(self):
         """Verify wait_for_presence_lock_release tolerates lock file deletion race condition."""
         sup = mod.ProcessSupervisor(self.mgr)
@@ -181,6 +225,8 @@ class TestFullEndToEndRotation(unittest.TestCase):
         self.orig_state = mod.STATE_FILE
         self.orig_cli = mod.CLI_DIR
         self.orig_presence = mod.PRESENCE_DIR
+        self.orig_gemini = mod.GEMINI_DIR
+        self.orig_set_keyring = mod.set_keyring_secret
         self.orig_popen = mod.subprocess.Popen
         self.orig_sleep = mod.time.sleep
 
@@ -188,8 +234,11 @@ class TestFullEndToEndRotation(unittest.TestCase):
         mod.STATE_FILE = self.temp_path / "accounts" / "supervisor_state.json"
         mod.CLI_DIR = self.temp_path / "cli"
         mod.PRESENCE_DIR = self.temp_path / "cli" / "presence"
+        mod.GEMINI_DIR = self.temp_path / "gemini"
         mod.CLI_DIR.mkdir(parents=True)
         mod.PRESENCE_DIR.mkdir(parents=True)
+        mod.GEMINI_DIR.mkdir(parents=True)
+        mod.set_keyring_secret = lambda s: True
 
         for s in [1, 2]:
             (mod.ACCOUNTS_DIR / str(s)).mkdir(parents=True)
@@ -203,6 +252,8 @@ class TestFullEndToEndRotation(unittest.TestCase):
         mod.STATE_FILE = self.orig_state
         mod.CLI_DIR = self.orig_cli
         mod.PRESENCE_DIR = self.orig_presence
+        mod.GEMINI_DIR = self.orig_gemini
+        mod.set_keyring_secret = self.orig_set_keyring
         mod.subprocess.Popen = self.orig_popen
         mod.time.sleep = self.orig_sleep
         self.temp_dir.cleanup()
@@ -297,14 +348,21 @@ class TestCliArgumentFiltering(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.orig_dir = mod.ACCOUNTS_DIR
         self.orig_state = mod.STATE_FILE
+        self.orig_gemini = mod.GEMINI_DIR
+        self.orig_set_keyring = mod.set_keyring_secret
         mod.ACCOUNTS_DIR = Path(self.temp_dir.name)
         mod.STATE_FILE = mod.ACCOUNTS_DIR / "supervisor_state.json"
+        mod.GEMINI_DIR = mod.ACCOUNTS_DIR / "gemini"
+        mod.GEMINI_DIR.mkdir(parents=True, exist_ok=True)
+        mod.set_keyring_secret = lambda s: True
         self.mgr = mod.AccountManager()
         self.sup = mod.ProcessSupervisor(self.mgr)
 
     def tearDown(self):
         mod.ACCOUNTS_DIR = self.orig_dir
         mod.STATE_FILE = self.orig_state
+        mod.GEMINI_DIR = self.orig_gemini
+        mod.set_keyring_secret = self.orig_set_keyring
         self.temp_dir.cleanup()
 
     def test_continue_mode_preserves_flags_and_strips_prompts(self):

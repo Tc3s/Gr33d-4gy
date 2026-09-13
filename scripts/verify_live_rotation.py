@@ -45,6 +45,11 @@ def run_live_verification():
     email_slot2 = mod.extract_email_from_path(mgr.accounts_dir / next_slot)
     print(f"[*] Slot dự kiến xoay tua: Slot {next_slot} ({email_slot2})\n")
 
+    # Snapshot accounts directory to guarantee zero contamination of real credentials
+    import tempfile, shutil
+    accounts_backup = tempfile.mkdtemp(prefix="agy_sup_acc_backup_")
+    shutil.copytree(mod.ACCOUNTS_DIR, Path(accounts_backup) / "accounts", dirs_exist_ok=True)
+
     events = []
     stop_monitor = threading.Event()
 
@@ -111,55 +116,54 @@ def run_live_verification():
 
     mod.subprocess.Popen = mock_popen
 
-    start_time = time.time()
     try:
+        start_time = time.time()
         quota_hit, reset_secs = sup.run_session([], is_continue=False)
+        elapsed = time.time() - start_time
+
+        print(f"[+] Kết quả Phiên 1:")
+        print(f"    - Quota Hit Detected: {quota_hit} (Thời gian phản hồi: {elapsed:.2f}s)")
+        print(f"    - Quota Reset Trích xuất: {reset_secs}s ({reset_secs // 3600} giờ {(reset_secs % 3600) // 60} phút)")
+
+        if quota_hit:
+            print("\n[2] Thực hiện xoay tua tài khoản:")
+            mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
+            new_slot = mgr.rotate_to_next()
+            new_email = mod.extract_email_from_path(mgr.accounts_dir / new_slot)
+            print(f"    - Đã chuyển sang Slot {new_slot} ({new_email})")
+            
+            p_acc = mod.GEMINI_DIR / "google_accounts.json"
+            active_in_file = json.loads(p_acc.read_text()).get("active") if p_acc.exists() else "N/A"
+            print(f"    - Trạng thái ~/.gemini/google_accounts.json: {active_in_file}")
+
+            print("\n[3] Khởi chạy Phiên 2 (Tiếp nối với cờ -c & --dangerously-skip-permissions):")
+            current_turn[0] = 2
+            quota_hit2, _ = sup.run_session([], is_continue=True)
+            print(f"    - Phiên 2 hoàn thành: Quota Hit = {quota_hit2}")
     finally:
-        pass
+        # Restore Popen
+        mod.subprocess.Popen = orig_popen
 
-    elapsed = time.time() - start_time
+        stop_monitor.set()
+        monitor_thread.join(timeout=0.5)
 
-    print(f"[+] Kết quả Phiên 1:")
-    print(f"    - Quota Hit Detected: {quota_hit} (Thời gian phản hồi: {elapsed:.2f}s)")
-    print(f"    - Quota Reset Trích xuất: {reset_secs}s ({reset_secs // 3600} giờ {(reset_secs % 3600) // 60} phút)")
+        print("\n" + "=" * 75)
+        print("  TIMELINE SỰ KIỆN THỰC TẾ TRÊN HỆ THỐNG (SYSTEM EVENT TRACE)")
+        print("=" * 75)
+        t0 = events[0][0] if events else 0
+        for ts, msg in events:
+            print(f"  [+{ts - t0:05.2f}s] {msg}")
+        print("=" * 75)
 
-    if quota_hit:
-        print("\n[2] Thực hiện xoay tua tài khoản:")
-        mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
-        new_slot = mgr.rotate_to_next()
-        new_email = mod.extract_email_from_path(mgr.accounts_dir / new_slot)
-        print(f"    - Đã chuyển sang Slot {new_slot} ({new_email})")
-        
-        p_acc = mod.GEMINI_DIR / "google_accounts.json"
-        active_in_file = json.loads(p_acc.read_text()).get("active") if p_acc.exists() else "N/A"
-        print(f"    - Trạng thái ~/.gemini/google_accounts.json: {active_in_file}")
-
-        print("\n[3] Khởi chạy Phiên 2 (Tiếp nối với cờ -c & --dangerously-skip-permissions):")
-        current_turn[0] = 2
-        quota_hit2, _ = sup.run_session([], is_continue=True)
-        print(f"    - Phiên 2 hoàn thành: Quota Hit = {quota_hit2}")
-
-    # Restore Popen
-    mod.subprocess.Popen = orig_popen
-
-    stop_monitor.set()
-    monitor_thread.join(timeout=0.5)
-
-    print("\n" + "=" * 75)
-    print("  TIMELINE SỰ KIỆN THỰC TẾ TRÊN HỆ THỐNG (SYSTEM EVENT TRACE)")
-    print("=" * 75)
-    t0 = events[0][0] if events else 0
-    for ts, msg in events:
-        print(f"  [+{ts - t0:05.2f}s] {msg}")
-    print("=" * 75)
-
-    # Restore original slot
-    print(f"\n[*] Đang khôi phục lại Slot {curr_slot} ban đầu cho hệ thống...")
-    mgr.state["slots"][curr_slot]["status"] = "ACTIVE"
-    mgr.state["slots"][curr_slot]["exhausted_until"] = 0
-    mgr.apply_slot(curr_slot)
-    mgr.save_state()
-    print("[+] Hoàn tất! Hệ thống đã trở lại trạng thái sẵn sàng ban đầu.")
+        # 100% Hermetic restore of real accounts directory and active slot
+        shutil.copytree(Path(accounts_backup) / "accounts", mod.ACCOUNTS_DIR, dirs_exist_ok=True)
+        shutil.rmtree(accounts_backup, ignore_errors=True)
+        mgr = mod.AccountManager()
+        mgr.state["slots"][curr_slot]["status"] = "ACTIVE"
+        mgr.state["slots"][curr_slot]["exhausted_until"] = 0
+        mgr.apply_slot(curr_slot)
+        mgr.save_state()
+        print("\n[+] Đã khôi phục hoàn toàn 100% dữ liệu gốc của ~/.gemini_accounts/.")
 
 if __name__ == "__main__":
     run_live_verification()

@@ -321,6 +321,20 @@ class AccountManager:
             src = GEMINI_DIR / fname
             dst = slot_dir / fname
             if src.exists():
+                try:
+                    with open(src, "r", encoding="utf-8") as f_check:
+                        data = json.load(f_check)
+                    if fname == "oauth_creds.json":
+                        if not isinstance(data, dict):
+                            continue
+                        if not any(k in data for k in ("access_token", "refresh_token", "id_token")):
+                            continue
+                    elif fname == "google_accounts.json":
+                        if not isinstance(data, dict):
+                            continue
+                except Exception:
+                    continue
+
                 with open(src, "rb") as f_in, open(dst, "wb") as f_out:
                     f_out.write(f_in.read())
                 try:
@@ -330,12 +344,17 @@ class AccountManager:
         # Sync keyring secret
         sec = get_keyring_secret()
         if sec:
-            dst_sec = slot_dir / "keyring_secret.json"
-            with open(dst_sec, "w") as f:
-                f.write(sec)
             try:
-                os.chmod(dst_sec, 0o600)
-            except OSError:
+                sec_json = json.loads(sec)
+                if isinstance(sec_json, dict) and any(k in sec_json for k in ("access_token", "refresh_token", "id_token")):
+                    dst_sec = slot_dir / "keyring_secret.json"
+                    with open(dst_sec, "w") as f:
+                        f.write(sec)
+                    try:
+                        os.chmod(dst_sec, 0o600)
+                    except OSError:
+                        pass
+            except Exception:
                 pass
 
     def apply_slot(self, slot: str) -> bool:
@@ -352,6 +371,10 @@ class AccountManager:
             if src.exists():
                 with open(src, "rb") as f_in, open(dst, "wb") as f_out:
                     f_out.write(f_in.read())
+                try:
+                    os.chmod(dst, 0o600)
+                except OSError:
+                    pass
 
         # Update Secret Service keyring
         if keyring_src.exists():
