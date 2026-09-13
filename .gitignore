@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Credentials & Tokens (CRITICAL: NEVER COMMIT SECRETS)
+*.json
+!tests/mock_*.json
+oauth_creds.json
+google_accounts.json
+keyring_secret.json
+supervisor_state.json
+.gemini_accounts/
+tokens/
+creds/
+
+# Logs & Run-time data
+*.log
+*.lock
+*.pid
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS artifacts
+.DS_Store
+*.swp
+*~

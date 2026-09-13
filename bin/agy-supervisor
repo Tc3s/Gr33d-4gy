@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""
+Production-Grade Antigravity (agy) Multi-Account Supervisor
+- Auto-injects and preserves --dangerously-skip-permissions
+- Dynamic N-Account Scaling: Supports arbitrary 1..N accounts (Slot 1, 2, 3, 4... N)
+- Seamless expansion with 'agy-supervisor add' or 'agy-supervisor login <N>'
+- Full D-Bus Secret Service (gnome-keyring) integration: prevents agy from loading cached tokens from keyring
+- Runs agy in a dedicated PTY slave (foreground session leader) to prevent SIGTTIN/SIGTTOU
+- Prevents terminal corruption via RAII termios restoration and ANSI reset sequences
+- Detects genuine quota exhaustion without false-positives
+- Enforces anti-abuse handover spacing (>= 2.0s) and Master Circuit Breaker
+- Subcommands: status, switch, save, login, add, setup, run
+"""
+
+import os
+import sys
+import pty
+import time
+import json
+import fcntl
+import termios
+import struct
+import signal
+import select
+import datetime
+import zoneinfo
+import base64
+from pathlib import Path
+
+# Base Paths
+HOME = Path.home()
+GEMINI_DIR = HOME / ".gemini"
+CLI_DIR = GEMINI_DIR / "antigravity-cli"
+LOG_DIR = CLI_DIR / "log"
+ACCOUNTS_DIR = HOME / ".gemini_accounts"
+STATE_FILE = ACCOUNTS_DIR / "supervisor_state.json"
+PRESENCE_DIR = CLI_DIR / "presence"
+
+# Quota Patterns
+TRUE_TERMINAL_QUOTA_PATTERNS = [
+    b"You have exhausted your quota on this model",
+    b"image generation quota exceeded"
+]
+
+FALSE_POSITIVE_PATTERNS = [
+    b"doRefreshQuota: skipped (throttled)",
+    b"starting reload (force=false)"
+]
+
+# D-Bus Keyring Helper Functions (for GNOME Keyring / Secret Service)
+try:
+    import dbus
+
+    def get_keyring_item(bus=None):
+        try:
+            if bus is None:
+                bus = dbus.SessionBus()
+            obj = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets/aliases/default")
+            col = dbus.Interface(obj, "org.freedesktop.Secret.Collection")
+            items = col.Get("org.freedesktop.Secret.Collection", "Items", dbus_interface="org.freedesktop.DBus.Properties")
+            for item_path in items:
+                item_obj = bus.get_object("org.freedesktop.secrets", item_path)
+                attrs = item_obj.Get("org.freedesktop.Secret.Item", "Attributes", dbus_interface="org.freedesktop.DBus.Properties")
+                if attrs.get("service") == "gemini" and attrs.get("username") == "antigravity":
+                    return item_obj
+        except Exception:
+            pass
+        return None
+
+    def get_keyring_secret():
+        try:
+            bus = dbus.SessionBus()
+            item_obj = get_keyring_item(bus)
+            if not item_obj:
+                return None
+            service = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets")
+            svc_iface = dbus.Interface(service, "org.freedesktop.Secret.Service")
+            session_path = svc_iface.OpenSession("plain", "")[1]
+            secret = item_obj.GetSecret(session_path, dbus_interface="org.freedesktop.Secret.Item")
+            return bytes(secret[2]).decode("utf-8")
+        except Exception:
+            return None
+
+    def set_keyring_secret(secret_str: str):
+        try:
+            bus = dbus.SessionBus()
+            service = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets")
+            svc_iface = dbus.Interface(service, "org.freedesktop.Secret.Service")
+            session_path = svc_iface.OpenSession("plain", "")[1]
+
+            obj = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets/aliases/default")
+            col = dbus.Interface(obj, "org.freedesktop.Secret.Collection")
+
+            props = dbus.Dictionary({
+                "org.freedesktop.Secret.Item.Label": dbus.String("Password for 'antigravity' on 'gemini'"),
+                "org.freedesktop.Secret.Item.Attributes": dbus.Dictionary({
+                    "service": "gemini",
+                    "username": "antigravity"
+                }, signature="ss")
+            }, signature="sv")
+
+            secret_bytes = secret_str.encode("utf-8")
+            secret_struct = dbus.Struct((
+                session_path,
+                dbus.Array([], signature="y"),
+                dbus.ByteArray(secret_bytes),
+                dbus.String("text/plain")
+            ), signature="oayays")
+
+            col.CreateItem(props, secret_struct, True)
+            return True
+        except Exception:
+            return False
+
+    def delete_keyring_secret():
+        try:
+            bus = dbus.SessionBus()
+            item_obj = get_keyring_item(bus)
+            if item_obj:
+                item_obj.Delete(dbus_interface="org.freedesktop.Secret.Item")
+                return True
+        except Exception:
+            pass
+        return False
+
+except ImportError:
+    def get_keyring_secret(): return None
+    def set_keyring_secret(secret_str: str): return False
+    def delete_keyring_secret(): return False
+
+def is_genuine_quota_log(chunk: bytes) -> bool:
+    for fp in FALSE_POSITIVE_PATTERNS:
+        if fp in chunk:
+            return False
+    if b"You have exhausted your quota on this model" in chunk:
+        return True
+    if b"RESOURCE_EXHAUSTED" in chunk and (
+        b"backend request" in chunk or 
+        b"grpc" in chunk or 
+        b"ConnectRPC" in chunk or 
+        b"CloudCode" in chunk or 
+        b"JetskiService" in chunk
+    ):
+        return True
+    if b"status code: 429" in chunk or b'"code": 429' in chunk:
+        return True
+    if b"model capacity exhausted" in chunk:
+        return True
+    return False
+
+def extract_email_from_path(slot_path: Path) -> str:
+    # 1. Try google_accounts.json
+    p_acc = slot_path / "google_accounts.json"
+    if p_acc.exists():
+        try:
+            with open(p_acc, "r") as f:
+                d = json.load(f)
+                if d.get("active"):
+                    return str(d["active"])
+        except Exception:
+            pass
+    # 2. Try decoding JWT in oauth_creds.json
+    p_oauth = slot_path / "oauth_creds.json"
+    if p_oauth.exists():
+        try:
+            with open(p_oauth, "r") as f:
+                d = json.load(f)
+                idt = d.get("id_token", "")
+                if "." in idt:
+                    payload = idt.split(".")[1]
+                    rem = len(payload) % 4
+                    if rem:
+                        payload += "=" * (4 - rem)
+                    decoded = json.loads(base64.urlsafe_b64decode(payload))
+                    return str(decoded.get("email", "Unknown"))
+        except Exception:
+            pass
+    # 3. Try keyring_secret.json
+    p_sec = slot_path / "keyring_secret.json"
+    if p_sec.exists():
+        try:
+            with open(p_sec, "r") as f:
+                d = json.load(f)
+                idt = d.get("id_token", "")
+                if "." in idt:
+                    payload = idt.split(".")[1]
+                    rem = len(payload) % 4
+                    if rem:
+                        payload += "=" * (4 - rem)
+                    decoded = json.loads(base64.urlsafe_b64decode(payload))
+                    return str(decoded.get("email", "Unknown"))
+        except Exception:
+            pass
+    return "Chưa cấu hình"
+
+class TerminalGuard:
+    """RAII context manager to guarantee clean terminal state on any exit or exception."""
+    def __init__(self):
+        self.orig_termios = None
+        self.is_tty = sys.stdin.isatty()
+
+    def __enter__(self):
+        if self.is_tty:
+            try:
+                self.orig_termios = termios.tcgetattr(sys.stdin.fileno())
+            except Exception:
+                pass
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.restore()
+
+    def restore(self):
+        if self.is_tty and self.orig_termios:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.orig_termios)
+            except Exception:
+                pass
+        sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\r\n")
+        sys.stdout.flush()
+
+class AccountManager:
+    def __init__(self):
+        self.state_file = STATE_FILE
+        self.accounts_dir = ACCOUNTS_DIR
+        self.ensure_dirs()
+        self.state = self.load_state()
+
+    def ensure_dirs(self):
+        self.accounts_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_all_slots(self) -> list:
+        """Dynamically discovers all numeric slots in ~/.gemini_accounts/."""
+        slots = set()
+        if self.accounts_dir.exists():
+            for d in self.accounts_dir.iterdir():
+                if d.is_dir() and d.name.isdigit() and int(d.name) >= 1:
+                    slots.add(int(d.name))
+        return sorted(list(slots)) if slots else [1]
+
+    def load_state(self):
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, "r") as f:
+                    data = json.load(f)
+                    if "slots" not in data:
+                        data["slots"] = {}
+                    return data
+            except Exception:
+                pass
+        return {
+            "current_slot": 1,
+            "slots": {}
+        }
+
+    def save_state(self):
+        with open(self.state_file, "w") as f:
+            json.dump(self.state, f, indent=2)
+
+    def get_current_slot(self) -> str:
+        return str(self.state.get("current_slot", 1))
+
+    def sync_back_current(self):
+        slot = self.get_current_slot()
+        slot_dir = self.accounts_dir / slot
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ["oauth_creds.json", "google_accounts.json"]:
+            src = GEMINI_DIR / fname
+            if src.exists():
+                with open(src, "rb") as f_in, open(slot_dir / fname, "wb") as f_out:
+                    f_out.write(f_in.read())
+        # Sync keyring secret
+        sec = get_keyring_secret()
+        if sec:
+            with open(slot_dir / "keyring_secret.json", "w") as f:
+                f.write(sec)
+
+    def apply_slot(self, slot: str) -> bool:
+        slot_dir = self.accounts_dir / str(slot)
+        oauth_src = slot_dir / "oauth_creds.json"
+        keyring_src = slot_dir / "keyring_secret.json"
+
+        if not oauth_src.exists() and not keyring_src.exists():
+            return False
+
+        for fname in ["oauth_creds.json", "google_accounts.json"]:
+            src = slot_dir / fname
+            dst = GEMINI_DIR / fname
+            if src.exists():
+                with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+                    f_out.write(f_in.read())
+
+        # Update Secret Service keyring
+        if keyring_src.exists():
+            try:
+                with open(keyring_src, "r") as f:
+                    sec_data = f.read().strip()
+                    if sec_data:
+                        set_keyring_secret(sec_data)
+            except Exception:
+                pass
+
+        self.state["current_slot"] = int(slot)
+        self.save_state()
+        return True
+
+    def calculate_midnight_pacific(self) -> int:
+        tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+        now = datetime.datetime.now(tz)
+        midnight = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=5, second=0, microsecond=0
+        )
+        return int(midnight.timestamp())
+
+    def mark_exhausted(self, slot: str, is_daily: bool = True):
+        now = int(time.time())
+        until = self.calculate_midnight_pacific() if is_daily else now + 60
+        if "slots" not in self.state:
+            self.state["slots"] = {}
+        self.state["slots"][str(slot)] = {
+            "status": "EXHAUSTED_DAILY" if is_daily else "COOLDOWN_RPM",
+            "exhausted_until": until
+        }
+        self.save_state()
+
+    def rotate_to_next(self) -> str:
+        self.sync_back_current()
+        now = int(time.time())
+        curr = int(self.get_current_slot())
+        
+        # Discover all valid configured slots dynamically
+        all_slots = [
+            s for s in self.get_all_slots()
+            if (self.accounts_dir / str(s) / "oauth_creds.json").exists() or 
+               (self.accounts_dir / str(s) / "keyring_secret.json").exists()
+        ]
+
+        if not all_slots:
+            sys.stdout.write("\r\n\033[1;31m[!] Lỗi: Chưa có tài khoản nào được cấu hình trong ~/.gemini_accounts/\033[0m\r\n")
+            sys.stdout.write("\033[1;33m[*] Chạy 'agy-supervisor add' để thêm tài khoản.\033[0m\r\n")
+            sys.stdout.flush()
+            return ""
+
+        # Filter out slots still in cooldown or daily exhaustion
+        available = [
+            s for s in all_slots
+            if now >= self.state.get("slots", {}).get(str(s), {}).get("exhausted_until", 0)
+        ]
+
+        # Refresh state for recovered slots
+        for s in available:
+            slot_key = str(s)
+            if slot_key in self.state.get("slots", {}):
+                self.state["slots"][slot_key]["status"] = "ACTIVE"
+
+        if not available:
+            # Circuit breaker: ALL configured accounts are exhausted
+            min_wait = min(self.state.get("slots", {}).get(str(i), {}).get("exhausted_until", now + 3600) for i in all_slots)
+            wait_seconds = max(10, min_wait - now)
+            hours = wait_seconds // 3600
+            mins = (wait_seconds % 3600) // 60
+            sys.stdout.write(f"\r\n\033[1;31m[!] Circuit Breaker: Toàn bộ {len(all_slots)} tài khoản khả dụng đã cạn daily quota.\033[0m\r\n")
+            sys.stdout.write(f"\033[1;33m[*] Reset quota vào lúc 00:05 PST (khoảng {hours} giờ {mins} phút nữa).\033[0m\r\n")
+            sys.stdout.flush()
+            return ""
+
+        # Dynamic circular rotation: pick the next slot in the configured sequence
+        curr_idx = all_slots.index(curr) if curr in all_slots else 0
+        next_slot = None
+        for step in range(1, len(all_slots) + 1):
+            candidate = all_slots[(curr_idx + step) % len(all_slots)]
+            if candidate in available:
+                next_slot = str(candidate)
+                break
+        if not next_slot:
+            next_slot = str(available[0])
+
+        time.sleep(2.0)
+        self.apply_slot(next_slot)
+        return next_slot
+
+class PTYSupervisor:
+    def __init__(self, account_mgr: AccountManager):
+        self.account_mgr = account_mgr
+        self.child_pid = None
+        self.master_fd = None
+
+    def wait_for_presence_lock_release(self, timeout=3.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            locked = False
+            if PRESENCE_DIR.exists():
+                for lock_file in PRESENCE_DIR.glob("*.lock"):
+                    try:
+                        with open(lock_file, "r") as f:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    except (BlockingIOError, OSError):
+                        locked = True
+                        break
+            if not locked:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def forward_window_size(self):
+        if sys.stdin.isatty() and self.master_fd:
+            try:
+                winsize = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+
+    def run_session(self, user_args, is_continue=False) -> bool:
+        """Runs agy in PTY. Returns True if quota triggered rotation, False on clean exit."""
+        self.wait_for_presence_lock_release()
+        master_fd, slave_fd = pty.openpty()
+        self.master_fd = master_fd
+
+        cmd = ["agy"]
+        if is_continue:
+            cmd.append("-c")
+
+        # ALWAYS guarantee --dangerously-skip-permissions is included
+        if "--dangerously-skip-permissions" not in user_args:
+            cmd.append("--dangerously-skip-permissions")
+
+        cmd.extend(user_args)
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(master_fd)
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                os.dup2(slave_fd, 0)
+                os.dup2(slave_fd, 1)
+                os.dup2(slave_fd, 2)
+                if slave_fd > 2:
+                    os.close(slave_fd)
+                os.execvp("agy", cmd)
+            except Exception as e:
+                sys.stderr.write(f"Failed to exec agy: {e}\n")
+            finally:
+                sys.exit(1)
+
+        os.close(slave_fd)
+        self.child_pid = pid
+        self.forward_window_size()
+
+        old_sigwinch = signal.signal(signal.SIGWINCH, lambda s, f: self.forward_window_size())
+
+        quota_detected = False
+        log_file = None
+        log_pos = 0
+
+        try:
+            while True:
+                if log_file is None or not os.path.exists(log_file):
+                    symlink = CLI_DIR / "cli.log"
+                    if symlink.exists():
+                        try:
+                            resolved = str(symlink.resolve())
+                            if os.path.exists(resolved):
+                                log_file = resolved
+                                log_pos = os.path.getsize(log_file)
+                        except OSError:
+                            pass
+
+                if log_file and os.path.exists(log_file):
+                    try:
+                        cur_size = os.path.getsize(log_file)
+                        if cur_size > log_pos:
+                            with open(log_file, "rb") as lf:
+                                lf.seek(log_pos)
+                                chunk = lf.read(cur_size - log_pos)
+                                log_pos = cur_size
+                                if is_genuine_quota_log(chunk):
+                                    quota_detected = True
+                                    break
+                    except OSError:
+                        pass
+
+                r, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [], 0.05)
+                
+                if sys.stdin.fileno() in r:
+                    try:
+                        data = os.read(sys.stdin.fileno(), 1024)
+                        if not data:
+                            break
+                        os.write(master_fd, data)
+                    except OSError:
+                        break
+
+                if master_fd in r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                        if not data:
+                            break
+                        if any(tp in data for tp in TRUE_TERMINAL_QUOTA_PATTERNS):
+                            quota_detected = True
+                            os.write(sys.stdout.fileno(), data)
+                            break
+                        os.write(sys.stdout.fileno(), data)
+                    except OSError:
+                        break
+
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    break
+
+        finally:
+            signal.signal(signal.SIGWINCH, old_sigwinch)
+            if quota_detected:
+                try:
+                    os.kill(pid, signal.SIGINT)
+                    for _ in range(20):
+                        wpid, status = os.waitpid(pid, os.WNOHANG)
+                        if wpid == pid:
+                            break
+                        time.sleep(0.1)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(0.5)
+                        os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
+        return quota_detected
+
+# Subcommand Handlers
+
+def cmd_status(mgr: AccountManager):
+    print("=" * 70)
+    print("  ANTIGRAVITY MULTI-ACCOUNT SUPERVISOR STATUS")
+    print("=" * 70)
+    curr = mgr.get_current_slot()
+    now = int(time.time())
+    
+    all_slots = mgr.get_all_slots()
+    print(f"Active Slot: Slot {curr} (Tổng số tài khoản đã nạp: {len(all_slots)})\n")
+    print(f"{'Slot':<6} {'Email':<32} {'Status':<18} {'Reset Info'}")
+    print("-" * 70)
+    for i in all_slots:
+        s_str = str(i)
+        slot_dir = mgr.accounts_dir / s_str
+        email = extract_email_from_path(slot_dir)
+        info = mgr.state.get("slots", {}).get(s_str, {})
+        status = info.get("status", "ACTIVE")
+        until = info.get("exhausted_until", 0)
+        
+        reset_str = "-"
+        if status == "EXHAUSTED_DAILY" and until > now:
+            rem = until - now
+            reset_str = f"{rem // 3600}h {(rem % 3600) // 60}m (00:05 PST)"
+        elif not (slot_dir / "oauth_creds.json").exists() and not (slot_dir / "keyring_secret.json").exists():
+            status = "NOT_CONFIGURED"
+            email = "[Chưa cấu hình]"
+        
+        marker = "-> " if s_str == curr else "   "
+        print(f"{marker}{s_str:<4} {email:<32} {status:<18} {reset_str}")
+    print("=" * 70)
+    print("💡 Thêm tài khoản mới: agy-supervisor add")
+
+def cmd_switch(mgr: AccountManager, target_slot: str):
+    if not target_slot.isdigit() or int(target_slot) < 1:
+        print("Sử dụng: agy-supervisor switch <số thứ tự slot, vd: 1, 2, 3, 4...>")
+        sys.exit(1)
+    mgr.sync_back_current()
+    target_dir = mgr.accounts_dir / target_slot
+    if not (target_dir / "oauth_creds.json").exists() and not (target_dir / "keyring_secret.json").exists():
+        print(f"[!] Lỗi: Slot {target_slot} chưa có dữ liệu. Chạy 'agy-supervisor login {target_slot}' trước.")
+        sys.exit(1)
+    mgr.apply_slot(target_slot)
+    email = extract_email_from_path(target_dir)
+    print(f"[+] Đã chuyển sang Slot {target_slot}: {email}")
+
+def cmd_save(mgr: AccountManager, target_slot: str):
+    if not target_slot.isdigit() or int(target_slot) < 1:
+        print("Sử dụng: agy-supervisor save <số thứ tự slot, vd: 1, 2, 3, 4...>")
+        sys.exit(1)
+    slot_dir = mgr.accounts_dir / target_slot
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ["oauth_creds.json", "google_accounts.json"]:
+        src = GEMINI_DIR / fname
+        if src.exists():
+            with open(src, "rb") as f_in, open(slot_dir / fname, "wb") as f_out:
+                f_out.write(f_in.read())
+    sec = get_keyring_secret()
+    if sec:
+        with open(slot_dir / "keyring_secret.json", "w") as f:
+            f.write(sec)
+    email = extract_email_from_path(slot_dir)
+    print(f"[+] Đã lưu token hiện tại vào Slot {target_slot}: {email}")
+
+def cmd_login(mgr: AccountManager, target_slot: str):
+    if not target_slot.isdigit() or int(target_slot) < 1:
+        print("Sử dụng: agy-supervisor login <số thứ tự slot, vd: 1, 2, 3, 4...>")
+        sys.exit(1)
+    
+    print(f"[*] Đang chuẩn bị đăng nhập cho Slot {target_slot}...")
+    mgr.sync_back_current()
+
+    # Backup current active to a temp location
+    tmp_backup = Path("/tmp") / f"gemini_auth_backup_{int(time.time())}"
+    tmp_backup.mkdir(exist_ok=True)
+    for fname in ["oauth_creds.json", "google_accounts.json"]:
+        src = GEMINI_DIR / fname
+        if src.exists():
+            with open(src, "rb") as f_in, open(tmp_backup / fname, "wb") as f_out:
+                f_out.write(f_in.read())
+            src.unlink()
+
+    # Also backup and delete keyring secret so agy cannot load cached tokens from gnome-keyring
+    old_keyring_sec = get_keyring_secret()
+    if old_keyring_sec:
+        with open(tmp_backup / "keyring_secret.json", "w") as f:
+            f.write(old_keyring_sec)
+    delete_keyring_secret()
+
+    print(f"\n\033[1;33m[!] Đã xóa cache file và Secret Service Keyring.\033[0m")
+    print(f"[!] Khởi động agy để mở trình duyệt xác thực OAuth cho Slot {target_slot}...")
+    print("[!] Trình duyệt sẽ mở ra. Vui lòng đăng nhập tài khoản Google tương ứng.")
+    print("[!] Sau khi đăng nhập và vào được agy, gõ /exit hoặc bấm Ctrl+D để hoàn tất lưu token.\n")
+    time.sleep(1.5)
+
+    with TerminalGuard():
+        os.system("agy")
+
+    # Capture newly created token from both ~/.gemini/ and keyring
+    new_oauth = GEMINI_DIR / "oauth_creds.json"
+    new_keyring = get_keyring_secret()
+
+    if new_oauth.exists() or new_keyring:
+        slot_dir = mgr.accounts_dir / target_slot
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ["oauth_creds.json", "google_accounts.json"]:
+            src = GEMINI_DIR / fname
+            if src.exists():
+                with open(src, "rb") as f_in, open(slot_dir / fname, "wb") as f_out:
+                    f_out.write(f_in.read())
+        if new_keyring:
+            with open(slot_dir / "keyring_secret.json", "w") as f:
+                f.write(new_keyring)
+
+        email = extract_email_from_path(slot_dir)
+        mgr.apply_slot(target_slot)
+        print(f"\n\033[1;32m[+] Thành công: Đã cấu hình và lưu Slot {target_slot}: {email}\033[0m\n")
+    else:
+        print("\n\033[1;31m[-] Không tìm thấy token mới. Đang khôi phục tài khoản trước đó...\033[0m")
+        # Restore backup
+        for fname in ["oauth_creds.json", "google_accounts.json"]:
+            src = tmp_backup / fname
+            if src.exists():
+                with open(src, "rb") as f_in, open(GEMINI_DIR / fname, "wb") as f_out:
+                    f_out.write(f_in.read())
+        if old_keyring_sec:
+            set_keyring_secret(old_keyring_sec)
+
+def cmd_add(mgr: AccountManager):
+    """Adds a new (N+1)-th account slot automatically."""
+    all_slots = mgr.get_all_slots()
+    # Find next slot index
+    configured = [
+        s for s in all_slots 
+        if (mgr.accounts_dir / str(s) / "oauth_creds.json").exists() or 
+           (mgr.accounts_dir / str(s) / "keyring_secret.json").exists()
+    ]
+    next_slot = max(configured) + 1 if configured else 1
+    print(f"[*] Thêm tài khoản mới vào Slot {next_slot} (Tài khoản thứ {len(configured) + 1})...")
+    cmd_login(mgr, str(next_slot))
+
+def cmd_setup(mgr: AccountManager):
+    print("=" * 65)
+    print("  THIẾT LẬP TÀI KHOẢN GOOGLE CHO AGY-SUPERVISOR")
+    print("=" * 65)
+    
+    all_slots = mgr.get_all_slots()
+    for s in all_slots:
+        s_dir = mgr.accounts_dir / str(s)
+        email = extract_email_from_path(s_dir)
+        print(f"[{s}] Slot {s}: {email}")
+        if email == "Chưa cấu hình":
+            ans = input(f"    Bạn có muốn đăng nhập Tài khoản {s} ngay bây giờ? (y/N): ").strip().lower()
+            if ans == "y":
+                cmd_login(mgr, str(s))
+
+    ans = input("\nBạn có muốn thêm tiếp tài khoản mới (N+1)? (y/N): ").strip().lower()
+    if ans == "y":
+        cmd_add(mgr)
+
+    print("\n[+] Hoàn tất thiết lập. Chạy 'agy-supervisor status' để kiểm tra danh sách.")
+
+def main():
+    mgr = AccountManager()
+
+    # Route Subcommands
+    if len(sys.argv) > 1:
+        first_arg = sys.argv[1]
+        if first_arg == "status":
+            cmd_status(mgr)
+            return
+        elif first_arg == "add":
+            cmd_add(mgr)
+            return
+        elif first_arg == "switch" and len(sys.argv) > 2:
+            cmd_switch(mgr, sys.argv[2])
+            return
+        elif first_arg == "save" and len(sys.argv) > 2:
+            cmd_save(mgr, sys.argv[2])
+            return
+        elif first_arg == "login" and len(sys.argv) > 2:
+            cmd_login(mgr, sys.argv[2])
+            return
+        elif first_arg == "setup":
+            cmd_setup(mgr)
+            return
+        elif first_arg in ["--help", "-h"]:
+            print("Antigravity Multi-Account Supervisor (Dynamic N-Account Scaling)")
+            print("\nSử dụng:")
+            print("  agy-supervisor [args...]       Khởi chạy agy với auto-failover & --dangerously-skip-permissions")
+            print("  agy-supervisor status          Xem danh sách tất cả các slot tài khoản & trạng thái quota")
+            print("  agy-supervisor add             Tự động tạo Slot N+1 và mở trình duyệt để nạp thêm tài khoản")
+            print("  agy-supervisor login <N>       Đăng nhập hoặc nạp lại tài khoản cho Slot N (vd: login 4, login 5...)")
+            print("  agy-supervisor switch <N>      Chuyển ngay lập tức sang Slot N")
+            print("  agy-supervisor save <N>        Lưu token đang active trong ~/.gemini vào Slot N")
+            print("  agy-supervisor setup           Trình hướng dẫn thiết lập tài khoản")
+            return
+
+    # Default runner: start supervisor session
+    user_args = sys.argv[1:]
+    curr_slot = mgr.get_current_slot()
+    mgr.apply_slot(curr_slot)
+
+    is_continue = False
+
+    with TerminalGuard() as guard:
+        while True:
+            supervisor = PTYSupervisor(mgr)
+            quota_hit = supervisor.run_session(user_args, is_continue=is_continue)
+
+            if quota_hit:
+                curr_slot = mgr.get_current_slot()
+                mgr.mark_exhausted(curr_slot, is_daily=True)
+                next_slot = mgr.rotate_to_next()
+                if not next_slot:
+                    sys.exit(0)
+                guard.restore()
+                email = extract_email_from_path(mgr.accounts_dir / next_slot)
+                sys.stdout.write(f"\r\n\033[1;33m[!] Hết quota ở Slot {curr_slot}.\033[0m\r\n")
+                sys.stdout.write(f"\033[1;32m[+] Tự động chuyển sang Slot {next_slot} ({email}). Nối tiếp phiên chat...\033[0m\r\n")
+                sys.stdout.flush()
+                is_continue = True
+                continue
+            else:
+                mgr.sync_back_current()
+                break
+
+if __name__ == "__main__":
+    main()
