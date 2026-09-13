@@ -30,7 +30,7 @@ def run_live_verification():
     print("=" * 75)
 
     mgr = mod.AccountManager()
-    curr_slot = mgr.get_current_slot()
+    curr_slot = str(mgr.get_current_slot())
     email_slot1 = mod.extract_email_from_path(mgr.accounts_dir / curr_slot)
     print(f"[*] Trạng thái ban đầu: Đang ở Slot {curr_slot} ({email_slot1})")
 
@@ -39,11 +39,12 @@ def run_live_verification():
         print("[!] Cần ít nhất 2 slot được cấu hình để kiểm thử xoay vòng.")
         return
 
-    next_slot = "2" if curr_slot == "1" else "1"
+    # Find next slot
+    available = [str(s) for s in all_slots if str(s) != curr_slot]
+    next_slot = available[0]
     email_slot2 = mod.extract_email_from_path(mgr.accounts_dir / next_slot)
     print(f"[*] Slot dự kiến xoay tua: Slot {next_slot} ({email_slot2})\n")
 
-    # Step 1: Track file modification and keyring changes
     events = []
     stop_monitor = threading.Event()
 
@@ -66,11 +67,9 @@ def run_live_verification():
     monitor_thread = threading.Thread(target=credential_monitor, daemon=True)
     monitor_thread.start()
 
-    # Step 2: Simulate Supervisor execution with a real target command
     print("[1] Khởi chạy ProcessSupervisor...")
     sup = mod.ProcessSupervisor(mgr)
 
-    # We will run a mock agy session or print mode session
     cli_symlink = mod.CLI_DIR / "cli.log"
     if not cli_symlink.exists():
         mod.CLI_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,10 +81,10 @@ def run_live_verification():
     resolved_log = cli_symlink.resolve()
     print(f"[*] Đang theo dõi file log thật: {resolved_log}")
 
-    # Injector thread: after 0.5s, write genuine quota line to the log file
-    def inject_quota_error():
-        time.sleep(0.6)
-        print("\n>>> [INJECTOR] Mô phỏng API Google trả về lỗi HTTP 429 RESOURCE_EXHAUSTED...")
+    # Injector function that executes strictly AFTER the session starts
+    def delayed_injector():
+        time.sleep(0.5)
+        print(">>> [INJECTOR] Mô phỏng API Google trả về lỗi HTTP 429 RESOURCE_EXHAUSTED...")
         quota_payload = (
             "I0913 12:55:00.123456  99999 run.go:387] Run: attempt 1 failed "
             "(RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h46m23s.), retrying in 4s\n"
@@ -95,75 +94,29 @@ def run_live_verification():
             f.flush()
         print(">>> [INJECTOR] Đã bơm log quota vào cli.log thành công!\n")
 
-    injector_thread = threading.Thread(target=inject_quota_error, daemon=True)
+    # Mock command that stays alive until SIGINT
+    mock_cmd = ["python3", "-c", "import time, signal; signal.signal(signal.SIGINT, lambda s,f: exit(130)); time.sleep(10)"]
 
-    # Step 3: Run session 1
+    orig_popen = mod.subprocess.Popen
+    current_turn = [1]
+
+    def mock_popen(cmd):
+        turn = current_turn[0]
+        events.append((time.time(), f"[COMMAND LAUNCHED] {' '.join(cmd)}"))
+        if turn == 1:
+            threading.Thread(target=delayed_injector, daemon=True).start()
+            return orig_popen(mock_cmd)
+        else:
+            return orig_popen(["python3", "-c", "import sys; print('Phiên 2 đang chạy mượt mà trên cùng terminal!'); sys.exit(0)"])
+
+    mod.subprocess.Popen = mock_popen
+
     start_time = time.time()
-    injector_thread.start()
+    try:
+        quota_hit, reset_secs = sup.run_session([], is_continue=False)
+    finally:
+        pass
 
-    # Run agy sleep simulation to verify signal and watcher interception
-    test_cmd = ["python3", "-c", "import time, signal; signal.signal(signal.SIGINT, lambda s,f: exit(130)); time.sleep(10)"]
-    
-    # Temporarily wrap run_session command to use test_cmd while exercising exact same ProcessSupervisor
-    orig_cmd_builder = sup.run_session
-    
-    def wrapped_run_session(user_args, is_continue=False):
-        # We test the real supervisor logic with the target test_cmd
-        sup.wait_for_presence_lock_release()
-        cmd = list(test_cmd)
-        
-        # Test command line construction logic
-        actual_cmd = ["agy"] + (["-c"] if is_continue else []) + ["--dangerously-skip-permissions"] + user_args
-        events.append((time.time(), f"[COMMAND BUILT] {' '.join(actual_cmd)}"))
-        
-        quota_detected = threading.Event()
-        quota_reset_secs = [0]
-        stop_watcher = threading.Event()
-
-        def log_watcher(proc):
-            tracked_file = resolved_log
-            tracked_pos = resolved_log.stat().st_size if resolved_log.exists() else 0
-
-            while not stop_watcher.is_set() and proc.poll() is None:
-                try:
-                    if tracked_file.exists():
-                        cur_size = tracked_file.stat().st_size
-                        if cur_size > tracked_pos:
-                            with open(tracked_file, "rb") as lf:
-                                lf.seek(tracked_pos)
-                                chunk = lf.read(cur_size - tracked_pos)
-                                tracked_pos = cur_size
-                                if mod.is_genuine_quota_log(chunk):
-                                    events.append((time.time(), "[WATCHER HIT] Genuine Quota Exhaustion Detected in cli.log!"))
-                                    quota_detected.set()
-                                    try:
-                                        text = chunk.decode("utf-8", errors="ignore")
-                                        quota_reset_secs[0] = mod.parse_reset_seconds(text)
-                                    except Exception:
-                                        pass
-                                    events.append((time.time(), f"[SIGNAL] Sending SIGINT to child process (PID {proc.pid})..."))
-                                    proc.send_signal(signal.SIGINT)
-                                    break
-                except Exception:
-                    pass
-                time.sleep(0.05)
-
-        proc = subprocess.Popen(cmd)
-        sup.child_process = proc
-        w_thread = threading.Thread(target=log_watcher, args=(proc,), daemon=True)
-        w_thread.start()
-
-        old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            proc.wait()
-        finally:
-            signal.signal(signal.SIGINT, old_sigint)
-            stop_watcher.set()
-            w_thread.join(timeout=0.5)
-
-        return quota_detected.is_set(), quota_reset_secs[0]
-
-    quota_hit, reset_secs = wrapped_run_session([], is_continue=False)
     elapsed = time.time() - start_time
 
     print(f"[+] Kết quả Phiên 1:")
@@ -176,12 +129,18 @@ def run_live_verification():
         new_slot = mgr.rotate_to_next()
         new_email = mod.extract_email_from_path(mgr.accounts_dir / new_slot)
         print(f"    - Đã chuyển sang Slot {new_slot} ({new_email})")
-        print(f"    - Trạng thái ~/.gemini/google_accounts.json: {json.loads((mod.GEMINI_DIR / 'google_accounts.json').read_text()).get('active')}")
+        
+        p_acc = mod.GEMINI_DIR / "google_accounts.json"
+        active_in_file = json.loads(p_acc.read_text()).get("active") if p_acc.exists() else "N/A"
+        print(f"    - Trạng thái ~/.gemini/google_accounts.json: {active_in_file}")
 
         print("\n[3] Khởi chạy Phiên 2 (Tiếp nối với cờ -c & --dangerously-skip-permissions):")
-        test_cmd = ["python3", "-c", "import sys; print('Phiên 2 đang chạy mượt mà trên cùng terminal!'); sys.exit(0)"]
-        quota_hit2, _ = wrapped_run_session([], is_continue=True)
+        current_turn[0] = 2
+        quota_hit2, _ = sup.run_session([], is_continue=True)
         print(f"    - Phiên 2 hoàn thành: Quota Hit = {quota_hit2}")
+
+    # Restore Popen
+    mod.subprocess.Popen = orig_popen
 
     stop_monitor.set()
     monitor_thread.join(timeout=0.5)
@@ -199,6 +158,7 @@ def run_live_verification():
     mgr.state["slots"][curr_slot]["status"] = "ACTIVE"
     mgr.state["slots"][curr_slot]["exhausted_until"] = 0
     mgr.apply_slot(curr_slot)
+    mgr.save_state()
     print("[+] Hoàn tất! Hệ thống đã trở lại trạng thái sẵn sàng ban đầu.")
 
 if __name__ == "__main__":
