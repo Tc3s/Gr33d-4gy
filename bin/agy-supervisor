@@ -133,28 +133,28 @@ except ImportError:
     def delete_keyring_secret(): return False
 
 def is_genuine_quota_log(chunk: bytes) -> bool:
-    for fp in FALSE_POSITIVE_PATTERNS:
-        if fp in chunk:
-            return False
-    if b"You have exhausted your quota on this model" in chunk:
-        return True
-    if b"RESOURCE_EXHAUSTED" in chunk and (
-        b"quota reached" in chunk or
-        b"code 429" in chunk or
-        b"429" in chunk or
-        b"backend request" in chunk or 
-        b"grpc" in chunk or 
-        b"ConnectRPC" in chunk or 
-        b"CloudCode" in chunk or 
-        b"JetskiService" in chunk
-    ):
-        return True
-    if b"status code: 429" in chunk or b'"code": 429' in chunk:
-        return True
-    if b"model capacity exhausted" in chunk:
-        return True
-    if b"image generation quota exceeded" in chunk:
-        return True
+    for line in chunk.split(b"\n"):
+        if any(fp in line for fp in FALSE_POSITIVE_PATTERNS):
+            continue
+        if b"You have exhausted your quota on this model" in line:
+            return True
+        if b"RESOURCE_EXHAUSTED" in line and (
+            b"quota reached" in line or
+            b"code 429" in line or
+            b"429" in line or
+            b"backend request" in line or 
+            b"grpc" in line or 
+            b"ConnectRPC" in line or 
+            b"CloudCode" in line or 
+            b"JetskiService" in line
+        ):
+            return True
+        if b"status code: 429" in line or b'"code": 429' in line:
+            return True
+        if b"model capacity exhausted" in line:
+            return True
+        if b"image generation quota exceeded" in line:
+            return True
     return False
 
 def parse_reset_seconds(text: str) -> int:
@@ -382,8 +382,18 @@ class AccountManager:
             wait_seconds = max(10, min_wait - now)
             hours = wait_seconds // 3600
             mins = (wait_seconds % 3600) // 60
-            sys.stdout.write(f"\r\n\033[1;31m[!] Circuit Breaker: Toàn bộ {len(all_slots)} tài khoản khả dụng đã cạn daily quota.\033[0m\r\n")
-            sys.stdout.write(f"\033[1;33m[*] Reset quota vào lúc 00:05 PST (khoảng {hours} giờ {mins} phút nữa).\033[0m\r\n")
+            sys.stdout.write("\r\n\033[1;31m" + "=" * 70 + "\033[0m\r\n")
+            sys.stdout.write(f"\033[1;31m[!] CIRCUIT BREAKER: Toàn bộ {len(all_slots)} tài khoản khả dụng đều đã cạn quota!\033[0m\r\n")
+            sys.stdout.write(f"\033[1;33m[*] Cooldown ngắn nhất còn lại: khoảng {hours} giờ {mins} phút nữa.\033[0m\r\n")
+            for i in all_slots:
+                s_str = str(i)
+                em = extract_email_from_path(self.accounts_dir / s_str)
+                u = self.state.get("slots", {}).get(s_str, {}).get("exhausted_until", 0)
+                rem = max(0, u - now)
+                sys.stdout.write(f"    - Slot {s_str} ({em}): chờ {rem // 3600}h {(rem % 3600) // 60}m\r\n")
+            sys.stdout.write("\033[1;36m💡 Muốn nạp thêm tài khoản mới: agy-supervisor add\033[0m\r\n")
+            sys.stdout.write("\033[1;36m💡 Nếu tài khoản đã có lại quota và muốn reset cooldown: agy-supervisor reset\033[0m\r\n")
+            sys.stdout.write("\033[1;31m" + "=" * 70 + "\033[0m\r\n\r\n")
             sys.stdout.flush()
             return ""
 
@@ -590,6 +600,32 @@ def cmd_status(mgr: AccountManager):
         print(f"{marker}{s_str:<4} {email:<32} {status:<18} {reset_str}")
     print("=" * 70)
     print("💡 Thêm tài khoản mới: agy-supervisor add")
+    print("💡 Reset cooldown tất cả: agy-supervisor reset")
+
+def cmd_reset(mgr: AccountManager, target_slot: str = "all"):
+    """Resets exhaustion cooldown for one or all slots."""
+    if "slots" not in mgr.state:
+        mgr.state["slots"] = {}
+
+    all_slots = mgr.get_all_slots()
+    if target_slot in ["all", "--all"]:
+        for s in all_slots:
+            s_str = str(s)
+            if s_str in mgr.state["slots"]:
+                mgr.state["slots"][s_str]["status"] = "ACTIVE"
+                mgr.state["slots"][s_str]["exhausted_until"] = 0
+        mgr.save_state()
+        print("\n\033[1;32m[+] Đã reset trạng thái toàn bộ tài khoản về ACTIVE.\033[0m\n")
+    else:
+        s_str = str(target_slot)
+        if s_str in mgr.state["slots"]:
+            mgr.state["slots"][s_str]["status"] = "ACTIVE"
+            mgr.state["slots"][s_str]["exhausted_until"] = 0
+            mgr.save_state()
+            print(f"\n\033[1;32m[+] Đã reset trạng thái Slot {target_slot} về ACTIVE.\033[0m\n")
+        else:
+            print(f"\n[!] Slot {target_slot} không tồn tại trong danh sách slots.")
+    cmd_status(mgr)
 
 def cmd_switch(mgr: AccountManager, target_slot: str):
     if not target_slot.isdigit() or int(target_slot) < 1:
@@ -741,6 +777,10 @@ def main():
         elif first_arg == "login" and len(sys.argv) > 2:
             cmd_login(mgr, sys.argv[2])
             return
+        elif first_arg == "reset":
+            target = sys.argv[2] if len(sys.argv) > 2 else "all"
+            cmd_reset(mgr, target)
+            return
         elif first_arg == "setup":
             cmd_setup(mgr)
             return
@@ -749,6 +789,7 @@ def main():
             print("\nSử dụng:")
             print("  agy-supervisor [args...]       Khởi chạy agy với auto-failover & --dangerously-skip-permissions")
             print("  agy-supervisor status          Xem danh sách tất cả các slot tài khoản & trạng thái quota")
+            print("  agy-supervisor reset [N|all]   Reset trạng thái cooldown quota của các slot về ACTIVE")
             print("  agy-supervisor add             Tự động tạo Slot N+1 và mở trình duyệt để nạp thêm tài khoản")
             print("  agy-supervisor login <N>       Đăng nhập hoặc nạp lại tài khoản cho Slot N (vd: login 4, login 5...)")
             print("  agy-supervisor switch <N>      Chuyển ngay lập tức sang Slot N")
@@ -769,15 +810,20 @@ def main():
             quota_hit, reset_secs = supervisor.run_session(user_args, is_continue=is_continue)
 
             if quota_hit:
+                # FIRST: Restore normal terminal buffer so circuit breaker and switch messages are visible
+                guard.restore()
                 curr_slot = mgr.get_current_slot()
                 mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
+                email_curr = extract_email_from_path(mgr.accounts_dir / curr_slot)
+                sys.stdout.write(f"\r\n\033[1;33m[!] Hết quota ở Slot {curr_slot} ({email_curr}). Đang kiểm tra xoay tua...\033[0m\r\n")
+                sys.stdout.flush()
+
                 next_slot = mgr.rotate_to_next()
                 if not next_slot:
                     sys.exit(0)
-                guard.restore()
-                email = extract_email_from_path(mgr.accounts_dir / next_slot)
-                sys.stdout.write(f"\r\n\033[1;33m[!] Hết quota ở Slot {curr_slot}.\033[0m\r\n")
-                sys.stdout.write(f"\033[1;32m[+] Tự động chuyển sang Slot {next_slot} ({email}). Nối tiếp phiên chat...\033[0m\r\n")
+
+                email_next = extract_email_from_path(mgr.accounts_dir / next_slot)
+                sys.stdout.write(f"\033[1;32m[+] Tự động chuyển sang Slot {next_slot} ({email_next}). Nối tiếp phiên chat...\033[0m\r\n")
                 sys.stdout.flush()
                 is_continue = True
                 continue
