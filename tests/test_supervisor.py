@@ -620,13 +620,12 @@ class TestLogEventClassificationEngine(unittest.TestCase):
         self.assertTrue(res.is_suspension)
         self.assertIn("unauthorized_client", res.reason.lower())
 
-    def test_auth_failure_401_not_logged_in_token_source(self):
-        """Verifies detection of missing token source log."""
+    def test_benign_startup_token_source_not_logged_in(self):
+        """Verifies that agy startup transient cache refresh log is classified as benign (NONE) to prevent suicide loops."""
         log = b"E1031 05:00:33.843767 75 errorreport.go:224] error getting token source: You are not logged into Antigravity."
         res = mod.classify_log_event(log)
-        self.assertEqual(res.event_type, mod.EVENT_AUTH_FAILURE)
-        self.assertTrue(res.is_terminal)
-        self.assertTrue(res.is_suspension)
+        self.assertEqual(res.event_type, mod.LogEventType.NONE)
+        self.assertFalse(res.is_terminal)
 
     def test_auth_failure_401_unauthenticated_grpc(self):
         """Verifies detection of gRPC Unauthenticated status."""
