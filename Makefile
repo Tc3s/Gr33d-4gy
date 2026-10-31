@@ -1,5 +1,5 @@
 # Makefile for agy-supervisor
-.PHONY: all help test check health verify install uninstall clean
+.PHONY: all help test e2e test-all check health verify install uninstall clean
 
 PYTHON ?= python3
 
@@ -10,7 +10,9 @@ help:
 	@echo "  agy-supervisor Developer & Admin Automation Tools"
 	@echo "======================================================================"
 	@echo "Available targets:"
-	@echo "  make test        - Run the regression and edge-case test suite (19 tests)"
+	@echo "  make test        - Run the master regression unit test suite (178 tests)"
+	@echo "  make e2e         - Run the 4-tier opaque-box E2E test suite (115 tests)"
+	@echo "  make test-all    - Run both master unit tests and all E2E tests"
 	@echo "  make health      - Run environment and credential health check audit"
 	@echo "  make verify      - Run live deterministic quota failover PoC simulation"
 	@echo "  make install     - Install binary to ~/.local/bin/ and setup bash alias"
@@ -20,6 +22,11 @@ help:
 
 test:
 	$(PYTHON) tests/test_supervisor.py
+
+e2e:
+	pytest tests/e2e/ -v
+
+test-all: test e2e
 
 health: check
 check:

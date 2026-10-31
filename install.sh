@@ -115,7 +115,7 @@ echo -e "  ${YELLOW}agy-supervisor reset [all|N]${NC}: Reset cooldowns quota c�
 echo -e "  ${YELLOW}agy-supervisor add${NC}        : Thêm tài khoản mới (Slot N+1)"
 echo -e "  ${YELLOW}agy-supervisor login <N>${NC}  : Đăng nhập tài khoản cho Slot N"
 echo -e "  ${YELLOW}agy-supervisor switch <N>${NC} : Chuyển ngay lập tức sang Slot N"
-echo -e "  ${YELLOW}make test${NC}                 : Chạy bộ kiểm thử tự động (17 unit & integration tests)"
+echo -e "  ${YELLOW}make test${NC}                 : Chạy bộ kiểm thử tự động (178 unit & 115 E2E tests)"
 echo -e "  ${YELLOW}make health${NC}               : Chạy chẩn đoán toàn diện hệ thống"
 echo -e "======================================================================\n"
 

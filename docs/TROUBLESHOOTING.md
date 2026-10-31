@@ -126,18 +126,99 @@ Tài liệu giải quyết các tình huống lỗi thường gặp khi sử d�
 
 ---
 
-### 7. Công Cụ Tự Động Chẩn Đoán Toàn Diện Hệ Thống (Health Check)
+### 7. Lỗi `CLIENT_ID_MISMATCH`: Token bị lệch Client ID (Nguồn gốc từ `@google/gemini-cli`)
 
-Để kiểm tra toàn bộ cấu hình, quyền hạn file, kết nối D-Bus, tính hợp lệ của token và trạng thái từng slot:
+* **Hiện tượng**:
+  Khi chạy `agy-supervisor status`, `agy-supervisor probe` hoặc khi chuyển slot, hệ thống cảnh báo:
+  ```text
+  ===========================================================================
+  [!] CẢNH BÁO: PHÁT HIỆN TOKEN KHÔNG TƯƠNG THÍCH CHO SLOT 1!
+  [*] Project Number     : 681255809395
+  [*] Diagnostic         : FOREIGN TOKEN CORRUPTION: Token was minted for Google client 'gemini-cli (@google/gemini-cli)'...
+  💡 HƯỚNG DẪN KHẮC PHỤC (REMEDIATION):
+     1. Chạy lệnh: agy-supervisor login 1
+     2. Đăng nhập đúng tài khoản trên trình duyệt Antigravity.
+     ⚠️ KHÔNG copy file oauth_creds.json từ gemini-cli hoặc các công cụ khác sang!
+  ===========================================================================
+  ```
+
+* **Nguyên nhân**:
+  Token của slot đó được cấp cho client ID của Gemini CLI (`681255809395`), không khớp với Client ID chính thức của Antigravity (`1071006060591`). Khi refresh sẽ dính lỗi HTTP 401 `unauthorized_client`.
+
+* **Cách xử lý**:
+  Đăng nhập lại chính chủ cho slot đó qua trình duyệt:
+  ```bash
+  agy-supervisor login <N>
+  # Ví dụ:
+  agy-supervisor login 1
+  ```
+  Sau khi hoàn tất xác thực trên trình duyệt, Supervisor sẽ tự động lưu token với Client ID hợp lệ.
+
+---
+
+### 8. Tài Khoản Bị Trạng Thái `NOTICE_BLOCKED` (Google Cảnh Báo Điều Khoản ToS)
+
+* **Hiện tượng**:
+  Slot tài khoản hiển thị trạng thái `NOTICE_BLOCKED` và thời gian cooldown lên tới 10 năm (cách ly an toàn).
+
+* **Nguyên nhân**:
+  Backend Google phát hiện hành vi bất thường hoặc tài khoản bị tạm khóa / yêu cầu xác minh điều khoản (`Terms of service update required` / `Account temporarily disabled`).
+
+* **Cách xử lý**:
+  1. Kiểm tra tài khoản trên trình duyệt xem Google có yêu cầu xác minh số điện thoại hoặc đồng ý điều khoản dịch vụ mới hay không.
+  2. Sau khi tài khoản trên web đã hoạt động bình thường, đăng nhập lại slot:
+     ```bash
+     agy-supervisor login <N>
+     ```
+  3. Reset trạng thái slot về `ACTIVE`:
+     ```bash
+     agy-supervisor reset <N>
+     ```
+
+---
+
+### 9. Rotational Circuit Breaker Kích Hoạt: "Phát hiện 4 lần chuyển slot liên tiếp trong <60s"
+
+* **Hiện tượng**:
+  Màn hình thông báo `ROTATIONAL CIRCUIT BREAKER TRIPPED!` và tạm dừng xoay tua 30 giây.
+
+* **Nguyên nhân**:
+  Tất cả các tài khoản trong pool đều đang gặp sự cố (hết hạn ngạch, lỗi xác thực hoặc token hỏng), khiến supervisor phải nhảy slot liên tục.
+
+* **Cách xử lý**:
+  1. Kiểm tra tình trạng sức khỏe tổng thể của các tài khoản:
+     ```bash
+     agy-supervisor probe
+     ```
+  2. Khắc phục các tài khoản bị lỗi auth hoặc thêm tài khoản mới có quota khả dụng:
+     ```bash
+     agy-supervisor add
+     ```
+
+---
+
+### 10. Công Cụ Chẩn Đoán & Kiểm Thử (Diagnostics & Testing)
+
+Kiểm tra nhanh tính hợp lệ của token, thời hạn hết hạn, và kết nối backend:
+```bash
+agy-supervisor probe
+```
+
+Kiểm tra toàn bộ cấu hình, quyền hạn file, kết nối D-Bus và trạng thái từng slot:
 ```bash
 make health
 # Hoặc chạy trực tiếp:
 python3 scripts/health_check.py
 ```
 
-Để chạy bộ 17 ca kiểm thử tự động xác thực toàn bộ logic hoạt động:
+Chạy bộ kiểm thử tự động toàn diện:
 ```bash
+# 1. Chạy 178 bài kiểm thử Master Unit & Hồi quy:
 make test
-# Hoặc chạy trực tiếp:
-python3 tests/test_supervisor.py
+
+# 2. Chạy 115 bài kiểm thử End-to-End Hộp đen (Tiers 1-4):
+make e2e
+
+# 3. Chạy toàn bộ 293 bài tests:
+make test-all
 ```

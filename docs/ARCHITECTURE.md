@@ -6,14 +6,14 @@ Tài liệu này phân tích chi tiết cấu trúc kỹ thuật tầng thấp (
 
 ## 1. Mô Hình Thực Thi TTY & Quản Lý Tín Hiệu (Linux Kernel & Terminal Execution)
 
-### 1.1 Hạn Chế Chết Người Của Việc Bọc TUI Qua PTY Proxy Hoặc Script
+### 1.1 Phân Tích Kỹ Thuật Khi Bọc TUI Qua PTY Proxy Hoặc Subprocess
 Antigravity CLI (`agy`) sử dụng framework giao diện TUI **BubbleTea** (viết bằng Go). Khi BubbleTea khởi động:
 1. Đưa terminal vào chế độ **Raw Mode**: xóa các cờ `ICANON` (không chờ phím Enter), `ECHO` (không tự in ký tự gõ), và `OPOST` (xử lý output thủ công).
 2. Phát chuỗi ANSI **`\x1b[?1049h` (`smcup`)** để chuyển toàn bộ màn hình sang Alternate Screen Buffer, và **`\x1b[?25l`** để ẩn con trỏ chuột.
 
-Khi xây dựng trình giám sát (Supervisor), có hai cạm bẫy kinh điển:
-* **Cạm bẫy PTY Proxy thiếu raw mode**: Nếu mở một PTY master/slave nhưng không đặt `sys.stdin` của tiến trình cha vào raw mode (`tty.setraw()`), driver TTY của hệ điều hành vẫn ở chế độ canonical (cooked mode). Toàn bộ phím gõ, mũi tên điều hướng, autocomplete sẽ bị đóng băng hoặc in ra ký tự rác (`^[[A`) cho đến khi bấm Enter. Việc dùng vòng lặp `select.select()` ở tiến trình cha còn tạo ra độ trễ I/O (latency) và dễ bị lỗi desync kích thước màn hình (`SIGWINCH`).
-* **Cạm bẫy Background Process Group (`SIGTTIN` / `SIGTTOU`)**: Nếu chạy `agy &` trong background, nhân Linux sẽ gửi tín hiệu **`SIGTTIN`** hoặc **`SIGTTOU`**, lập tức dừng tiến trình.
+Khi xây dựng trình giám sát (Supervisor), có hai lỗi kiến trúc phổ biến:
+* **PTY Proxy thiếu cấu hình raw mode**: Nếu mở một PTY master/slave nhưng không đặt `sys.stdin` của tiến trình cha vào raw mode (`tty.setraw()`), driver TTY của hệ điều hành vẫn ở chế độ canonical (cooked mode). Toàn bộ phím gõ, mũi tên điều hướng, autocomplete sẽ bị đóng băng hoặc in ra ký tự rác (`^[[A`) cho đến khi bấm Enter. Việc dùng vòng lặp `select.select()` ở tiến trình cha còn tạo ra độ trễ I/O và gây lỗi desync kích thước màn hình (`SIGWINCH`).
+* **Tiến trình con bị đẩy vào Background (`SIGTTIN` / `SIGTTOU`)**: Nếu chạy `agy &` trong background, nhân Linux sẽ gửi tín hiệu **`SIGTTIN`** hoặc **`SIGTTOU`**, lập tức dừng tiến trình.
 
 ### 1.2 Kiến Trúc Tối Ưu: Direct Foreground Execution + Daemon Log Watcher
 `agy-supervisor` áp dụng mô hình thực thi trực tiếp trên Foreground TTY kết hợp luồng giám sát ngầm:
@@ -29,7 +29,7 @@ sequenceDiagram
     Supervisor->>Supervisor: wait_for_presence_lock_release() (TOCTOU-Safe)
     Supervisor->>Supervisor: Thiết lập Signal Forwarders (SIGTERM, SIGHUP) & Bỏ qua SIGINT
     Supervisor->>agy: subprocess.Popen(["agy", "--dangerously-skip-permissions", ...])
-    Note over agy, User: agy thừa hưởng trực tiếp stdin, stdout, stderr (fd 0, 1, 2)<br/>BubbleTea điều khiển 100% Native TTY: 0ms latency, phím tắt, chuột & resize mượt mà!
+    Note over agy, User: agy thừa hưởng trực tiếp stdin, stdout, stderr (fd 0, 1, 2)<br/>BubbleTea điều khiển TTY: không trễ I/O, phím tắt, chuột & resize chuẩn POSIX
     
     Supervisor->>Watcher: Khởi chạy luồng theo dõi cli.log (Daemon)
     
@@ -40,38 +40,50 @@ sequenceDiagram
         agy->>Log: Ghi log hoạt động / API responses
     end
 
-    alt Phát hiện Quota Exhausted (HTTP 429 / 503 / RESOURCE_EXHAUSTED)
-        Log->>Watcher: Line: "(RESOURCE_EXHAUSTED (code 429): Individual quota reached... Resets in 4h46m23s.)"
-        Watcher->>Watcher: Line-buffered evaluation -> is_genuine_quota_log() = True
-        Watcher->>Watcher: parse_reset_seconds() -> 17183s (4h46m23s)
-        Watcher->>agy: Thang thoát tín hiệu: proc.send_signal(SIGINT) (chờ 2.5s)
-        Note over agy: agy nhận SIGINT: commit SQLite WAL, nhả presence lock, dừng an toàn!
+    alt Phát hiện Sự kiện Đa tầng (Notice, Auth Error, hoặc Quota Exhausted)
+        Log->>Watcher: Line: "RESOURCE_EXHAUSTED (code 429)..." hoặc "Account suspended / Notice"
+        Watcher->>Watcher: classify_log_event(line) -> LogEventClassification (Priority-Based)
+        alt EVENT_TRANSIENT_503
+            Watcher->>Watcher: Bỏ qua 503, cho phép agy tự thử lại (self-retry)
+        else EVENT_ACCOUNT_NOTICE
+            Watcher->>Supervisor: Đánh dấu slot NOTICE_BLOCKED (cách ly 10 năm)
+            Watcher->>agy: kill_process_tree (Bottom-Up: SIGINT -> SIGTERM -> SIGKILL)
+        else EVENT_AUTH_FAILURE
+            Watcher->>Supervisor: Đánh dấu slot AUTH_FAILED, tạm ngưng chờ login lại
+            Watcher->>agy: kill_process_tree (Bottom-Up: SIGINT -> SIGTERM -> SIGKILL)
+        else EVENT_QUOTA_EXHAUSTED
+            Watcher->>Watcher: parse_reset_seconds() -> tính thời gian hồi phục thực tế
+            Watcher->>agy: kill_process_tree: SIGINT (2.5s) -> SIGTERM (1.0s) -> SIGKILL
+        end
+        Note over agy: Toàn bộ cây tiến trình con & cháu dừng hoàn toàn (is_tree_dead = True)
         agy-->>Supervisor: proc.wait() hoàn tất
         Supervisor->>Supervisor: TerminalGuard.restore() (Trở về Main Buffer trước khi in)
-        Supervisor->>Supervisor: mark_exhausted(curr_slot, reset_secs)
-        Supervisor->>Supervisor: rotate_to_next() (Apply token & D-Bus Keyring Slot mới)
+        Supervisor->>Supervisor: fork_conversation() (Nhân bản SQLite WAL & cấp mới Trajectory UUID)
+        Supervisor->>Supervisor: rotate_to_next() (Jitter 2.0s-5.0s, đồng bộ token & D-Bus Keyring Slot mới)
         Supervisor->>User: "[+] Tự động chuyển sang Slot 2. Nối tiếp phiên chat..."
         Supervisor->>agy: Khởi chạy lại agy với cờ: ["-c", "--dangerously-skip-permissions"]
     end
 ```
 
-### 1.3 Thang Thoát Tín Hiệu Chống Deadlock (Signal Escalation Ladder)
-Nếu child process bị crash ngầm, kẹt trong vòng lặp hoặc phớt lờ `SIGINT`, lệnh `proc.wait()` ở main thread có thể bị deadlock vĩnh viễn. Để khắc phục, watcher thread thực thi thang leo thang tín hiệu:
+### 1.3 Triệt Tiêu Cây Tiến Trình Con Cháu & Chống Zombie (kill_process_tree & is_tree_dead)
+Nếu child process spawn thêm các tiến trình cháu (grandchildren) hoặc chạy nền, việc chỉ gửi tín hiệu cho process cha sẽ để lại các tiến trình mồ côi (orphans/zombies) tiếp tục chiếm giữ presence lock. Đồng thời, nếu gửi `os.killpg()` nhầm vào Process Group của chính Supervisor, Supervisor sẽ vô tình tự hủy (process self-kill).
+
+Để giải quyết triệt để cả hai vấn đề, `agy-supervisor` áp dụng cơ chế:
+1. **Cô lập Process Group**: Sử dụng `preexec_fn=os.setsid` khi `subprocess.Popen` để tiến trình con trở thành Session Leader riêng biệt.
+2. **Thuật toán quét sống chết toàn cây (`is_tree_dead`)**: Duyệt ngược từ dưới lên (Bottom-Up) và tích lũy danh sách `known_descendants`.
+3. **Thang leo thang tín hiệu 3 cấp độ**:
 ```python
-# Watcher thread signal escalation:
-proc.send_signal(signal.SIGINT)
-for _ in range(25): # Chờ tối đa 2.5 giây
-    if proc.poll() is not None:
-        break
-    time.sleep(0.1)
-else:
-    proc.terminate() # Gửi SIGTERM nếu SIGINT bị phớt lờ
-    for _ in range(10): # Chờ tiếp 1.0 giây
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill() # Ép buộc ngắt bằng SIGKILL
+# Thuật toán kill_process_tree:
+def kill_process_tree(proc, timeout=3.0):
+    # 1. Gửi SIGINT cho toàn bộ Session Group con
+    os.killpg(child_pgid, signal.SIGINT)
+    # 2. Polling kiểm tra is_tree_dead()
+    if not is_tree_dead(child_pgid, known_descendants, timeout=2.5):
+        # 3. Leo thang sang SIGTERM
+        os.killpg(child_pgid, signal.SIGTERM)
+        if not is_tree_dead(child_pgid, known_descendants, timeout=1.0):
+            # 4. Cưỡng chế ngắt bằng SIGKILL
+            os.killpg(child_pgid, signal.SIGKILL)
 ```
 
 Đồng thời, tiến trình cha đăng ký forwarder cho `SIGTERM` và `SIGHUP` để không bao giờ để lại tiến trình con mồ côi (orphan process) khi terminal bị tắt.
@@ -97,12 +109,12 @@ def restore(self):
 
 ## 2. Engine Đọc Log Streaming & Xử Lý Cắt Khúc Ranh Giới (Line-Buffered Watcher)
 
-### 2.1 Cạm Bẫy Cắt Đôi Từ Khóa (Chunk Boundary Slicing)
+### 2.1 Xử Lý Ranh Giới Chunk Khi Đọc Stream (Chunk Boundary Slicing)
 Khi đọc stream từ file descriptor bằng `read(cur_size - tracked_pos)`, các chunk byte được trả về theo buffer của hệ điều hành. Nếu một chuỗi quan trọng như `RESOURCE_EXHAUSTED` bị cắt đôi ở ranh giới giữa hai chunk:
 - Chunk 1 kết thúc bằng: `... failed (RESOUR`
 - Chunk 2 bắt đầu bằng: `CE_EXHAUSTED (code 429) ...`
 
-Nếu kiểm tra từng chunk độc lập, cả hai lần đọc đều đánh giá `False`, dẫn đến **bỏ lọt lỗi (False Negative)** và hệ thống bị treo.
+Nếu kiểm tra từng chunk độc lập mà không ghép dòng, cả hai lần đọc đều trả về `False` (bỏ lọt sự kiện cạn quota).
 `agy-supervisor` triển khai bộ đệm dòng (`line_buffer`):
 ```python
 content = line_buffer + new_bytes
@@ -110,8 +122,9 @@ lines = content.split(b"\n")
 line_buffer = lines.pop() # Giữ lại phần dòng chưa hoàn thiện cho lần đọc sau
 
 for line in lines:
-    if is_genuine_quota_log(line):
-        quota_detected.set()
+    classification = classify_log_event(line)
+    if classification.event != LogEvent.EVENT_NONE:
+        # Xử lý theo thứ bậc ưu tiên: NOTICE > AUTH > QUOTA > TRANSIENT
         ...
 ```
 
@@ -180,3 +193,65 @@ Khi chuyển từ phiên thông thường sang phiên nối tiếp (`is_continue
 2. Cờ `-c` được chèn vào đầu để kích hoạt chế độ continue.
 3. Các cờ cấu hình môi trường chạy kèm giá trị (`--model`, `-m`, `--effort`, `-e`, `--agent`, `-a`, `--project`, `--mode`, `--add-dir`, `--conversation`) được bảo lưu toàn vẹn.
 4. Các cờ thực thi prompt một lần (`-p`, `--print`, `--prompt`, `-i`, `--prompt-interactive`) được lược bỏ sạch sẽ, tránh hiện tượng prompt cũ bị gửi lặp lại trong phiên chat mới.
+
+---
+
+## 7. Động Cơ Phân Loại Sự Kiện Đa Tầng (Notice & Event Classification Engine)
+
+Để loại trừ hoàn toàn hiện tượng "Notice Blindness" (mù trước lỗi vi phạm điều khoản dẫn đến bão 236 request lỗi và khóa tài khoản 56 giờ), `classify_log_event(line)` thực thi bộ phân loại theo thứ tự ưu tiên nghiêm ngặt:
+
+1. **`EVENT_ACCOUNT_NOTICE`**:
+   - Khớp các chữ ký nghiêm trọng: `account.*suspended`, `terms of service violation`, `account temporarily disabled`, `ineligible tier`.
+   - Hành vi: Đánh dấu slot `NOTICE_BLOCKED`, thiết lập thời gian hạ nhiệt cách ly 10 năm (`315360000s`), dừng ngay lập tức việc retry trên slot này để bảo vệ tài khoản.
+2. **`EVENT_AUTH_FAILURE`**:
+   - Khớp các mã lỗi: `HTTP 401 Unauthorized`, `unauthorized_client`, `token revoked`, `invalid_grant`, `HTTP 403 Forbidden` (do credential).
+   - Hành vi: Đánh dấu slot `AUTH_FAILED`, tạm dừng xoay tua trên slot này cho đến khi người dùng đăng nhập lại qua `agy-supervisor login <N>`.
+3. **`EVENT_QUOTA_EXHAUSTED`**:
+   - Khớp: `HTTP 429 Too Many Requests`, `RESOURCE_EXHAUSTED`, `Individual quota reached`, `rate limit exceeded`.
+   - Hành vi: Trích xuất `reset_seconds` chính xác từ payload phản hồi hoặc thời gian reset Pacific Midnight, đánh dấu `EXHAUSTED_DAILY` và chuyển sang slot tiếp theo.
+4. **`EVENT_TRANSIENT_503`**:
+   - Khớp: `HTTP 503 Service Unavailable`, `model overloaded`, `no capacity available on the server`.
+   - Hành vi: Không ngắt tiến trình, cho phép cơ chế retry nội bộ của `agy` tự khắc phục mà không đánh giá nhầm tài khoản bị cạn hạn ngạch.
+
+---
+
+## 8. Kiến Trúc Bộ Ngắt Mạch Kép Chống Bão Lỗi (Dual Circuit Breakers)
+
+### 8.1 Thrashing Storm Circuit Breaker (`ThrashingStormCircuitBreaker`)
+- **Mục tiêu**: Ngăn chặn tình trạng spam request dồn dập khi các tài khoản liên tục gặp lỗi 4xx.
+- **Cơ chế**:
+  - Áp dụng cửa sổ trượt (Sliding Window) 60 giây.
+  - Nếu số lỗi liên tiếp đạt ngưỡng $\ge 3$ lỗi, mạch chuyển sang trạng thái `OPEN`.
+  - Áp dụng thời gian làm mát lùi hàm mũ (Exponential Backoff): $60s \to 120s \to 240s$ (tối đa 3600s).
+  - Trạng thái ngắt mạch được lưu trữ bền vững trong `circuit_breaker_state.json` và đồng bộ qua khóa luồng `threading.RLock()`.
+
+### 8.2 Rotational Circuit Breaker (`RotationalBreaker`)
+- **Mục tiêu**: Ngăn chặn vòng lặp quay vòng slot quá nhanh khi tất cả các tài khoản đều không thể phục vụ.
+- **Cơ chế**: Nếu hệ thống thực hiện $\ge 4$ lần chuyển đổi slot trong vòng dưới 60 giây, Supervisor sẽ tự động kích hoạt hãm phanh an toàn 30 giây và cảnh báo người dùng.
+
+---
+
+## 9. Cách Ly Phiên SQLite WAL & Tách Biệt Trajectory (Session Lineage Isolation)
+
+Khi chuyển giao phiên chat từ Slot cũ sang Slot mới:
+1. **URI Read-Only & Online Backup**: Để tránh lỗi khóa database (`SQLITE_BUSY`) hoặc xung đột file `-wal`/`-shm`, Supervisor mở database gốc với cờ `file:{src_db}?mode=ro` và sử dụng API SQLite Online Backup `src_conn.backup(dst_conn)`.
+2. **Atomic Promotion**: Đẩy cơ sở dữ liệu đã clone vào vị trí đích bằng hàm POSIX nguyên tử `os.replace()`.
+3. **Trajectory UUID Regeneration**: Tự động sinh mới UUID cho chuỗi hội thoại của slot mới trong bảng `conversations`, ngăn chặn thuật toán phân tích hành vi của Google phát hiện sự liên kết giữa các phiên của các tài khoản khác nhau trên cùng một máy.
+
+---
+
+## 10. Kiểm Thực Khán Giả Token & Thăm Dò Sức Khỏe Slot (`AudienceValidator` & `SlotHealthProber`)
+
+### 10.1 Audience Validator & Client ID Guard
+- Giải mã payload JWT `id_token` mà không cần secret key, trích xuất trường `aud` (Audience) và `azp` (Authorized Party).
+- Đối chiếu với bộ Client ID hợp lệ của Antigravity CLI:
+  - Consumer Client ID: `1071006060591-...`
+  - Enterprise GCP Client ID: `884354919052-...`
+- Nếu phát hiện token ngoại lai (ví dụ `681255809395` từ `@google/gemini-cli`), hệ thống sẽ gán trạng thái `CLIENT_ID_MISMATCH`, in hộp cảnh báo chi tiết và tự động bỏ qua slot này trong luồng xoay tua để bảo vệ tài khoản.
+
+### 10.2 Slot Health Prober Out-of-Band
+- Cho phép kiểm tra trạng thái token và quota mà không tiêu hao prompt token của người dùng.
+- Kết nối trực tiếp tới các endpoint nội bộ của Google CloudCode:
+  - `POST /v1internal:loadCodeAssist`
+  - `POST /v1internal:retrieveUserQuota`
+- Phân biệt rõ ràng giữa lỗi mạng tạm thời (HTTP 500/503 $\to$ `NETWORK_ERROR`) và lỗi xác thực vĩnh viễn (HTTP 401 $\to$ `TOKEN_REVOKED`). Xử lý an toàn các ngoại lệ `JSONDecodeError` và áp mức sàn làm mát tối thiểu 1 giờ nếu timestamp reset bị âm hoặc lỗi thời.

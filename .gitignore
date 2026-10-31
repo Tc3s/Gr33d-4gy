@@ -57,3 +57,12 @@ htmlcov/
 *~
 .idea/
 .vscode/
+
+# Subagent & Local Orchestration Artifacts (Contains local test logs & emails)
+.agents/
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
+
+
+docs/AGY_PROTOCOL_REVERSE_ENGINEERING.md

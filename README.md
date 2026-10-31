@@ -2,7 +2,7 @@
 
 Engine điều phối đa tài khoản và tự động chuyển đổi phiên (session failover) khi chạm ngưỡng quota cho Google Antigravity CLI (`agy`) trên Linux.
 
-Chạy trực tiếp `agy` trên foreground TTY của host, bắt lỗi cạn kiệt quota theo thời gian thực qua cơ chế streaming log evaluation, hoán đổi nóng thông tin xác thực OAuth giữa $N$ slot tài khoản (đồng bộ cấp tệp tin và D-Bus Secret Service), đồng thời tiếp tục chính xác ngữ cảnh hội thoại qua lệnh `agy -c` cùng cờ `--dangerously-skip-permissions`.
+Chạy trực tiếp `agy` trên foreground TTY, giám sát streaming log phát hiện cạn quota thời gian thực, hoán đổi thông tin xác thực OAuth giữa $N$ slot tài khoản (đồng bộ filesystem và D-Bus Secret Service), và nối tiếp phiên qua `agy -c` kèm `--dangerously-skip-permissions`.
 
 ---
 
@@ -19,15 +19,15 @@ sequenceDiagram
 
     Supervisor->>agy: spawn agy foreground (thừa hưởng stdin/stdout/stderr)
     Supervisor->>Watcher: khởi chạy log watcher đọc từng dòng trên cli.log
-    Note over User,agy: Tương tác raw-mode gốc độ trễ 0ms (vi-keys, autocomplete, chuột)
+    Note over User,agy: Tương tác raw-mode (vi-keys, autocomplete, chuột)
 
-    alt Chạm ngưỡng Quota (429 / 503 / RESOURCE_EXHAUSTED)
+    alt Chạm ngưỡng Quota (HTTP 429 / RESOURCE_EXHAUSTED)
         Watcher->>Watcher: phát hiện log quota thực & bóc tách thời gian reset
         Watcher->>agy: gửi tín hiệu SIGINT (dừng an toàn)
         agy-->>Supervisor: thoát tiến trình (commit SQLite WAL & nhả lock)
         Supervisor->>Keyring: cập nhật SetSecret tại chỗ & hoán đổi slot ~/.gemini
         Supervisor->>agy: khởi chạy lại agy -c --dangerously-skip-permissions
-        Note over User,agy: Phiên làm việc tiếp tục mượt mà trên cùng một terminal
+        Note over User,agy: Phiên làm việc tiếp tục trên cùng terminal
     end
 ```
 
@@ -58,6 +58,7 @@ Binary thực thi được cài đặt vào `~/.local/bin/agy-supervisor` kèm a
 | :--- | :--- |
 | `agy-supervisor [args...]` | Khởi chạy phiên làm việc foreground với auto-failover và cờ `--dangerously-skip-permissions` |
 | `agy-supervisor status` | Hiển thị bảng trạng thái tất cả slot, slot đang kích hoạt, và đồng hồ cooldown |
+| `agy-supervisor probe [all\|<N>]` | Kiểm tra tính hợp lệ của token, thời hạn hết hạn (expiry), và kết nối cloud API |
 | `agy-supervisor add` | Tạo Slot $N+1$ mới và khởi chạy quy trình đăng nhập OAuth |
 | `agy-supervisor login <N>` | Xác thực hoặc đăng nhập lại tài khoản Google cho Slot $N$ |
 | `agy-supervisor switch <N>` | Chuyển đổi trực tiếp thông tin xác thực sang Slot $N$ ngay lập tức |
@@ -92,6 +93,30 @@ Binary thực thi được cài đặt vào `~/.local/bin/agy-supervisor` kèm a
 ### 5. Lưu trữ trạng thái nguyên tử (Atomic State Persistence)
 - Mọi thao tác ghi vào `supervisor_state.json` đều được thực hiện qua file tạm (`.tmp`), gọi lệnh `os.fsync()`, và thay thế nguyên tử chuẩn POSIX (`os.replace()`), loại trừ rủi ro hỏng dữ liệu khi tắt đột ngột.
 
+### 6. Động cơ Phân loại Sự kiện Đa tầng (Notice & Multi-Event Engine)
+- Thay thế bộ lọc cũ bằng hàm `classify_log_event()` phân loại theo thứ bậc ưu tiên:
+  1. `EVENT_ACCOUNT_NOTICE`: Phát hiện cảnh báo ToS / đình chỉ tài khoản $\to$ cách ly an toàn 10 năm, ngắt gửi request lập tức để bảo vệ tài khoản.
+  2. `EVENT_AUTH_FAILURE`: Nhận diện lỗi xác thực 401 / 403 (`unauthorized_client`, token revoked) $\to$ tạm ngưng slot và yêu cầu login lại, không xoay tua mù quáng.
+  3. `EVENT_QUOTA_EXHAUSTED`: Nhận diện chạm trần hạn ngạch 429 và bóc tách thời gian reset chính xác từ CloudCode PA hoặc Pacific Midnight.
+  4. `EVENT_TRANSIENT_503`: Bỏ qua các lỗi quá tải cụm server tạm thời, cho phép `agy` tự retry mà không làm gián đoạn phiên.
+
+### 7. Bộ Ngắt Mạch Chống Bão Lỗi (Dual-Stage Circuit Breakers)
+- **`ThrashingStormCircuitBreaker`**: Ngắt mạch nếu phát hiện $\ge 3$ lỗi 4xx trong cửa sổ trượt 60 giây, áp dụng thời gian làm mát lùi hàm mũ ($60s \to 120s \to 240s$) nhằm triệt tiêu hoàn toàn nguy cơ dính án phạt khóa tài khoản 56 giờ.
+- **`RotationalBreaker`**: Tự động hãm phanh 30 giây nếu hệ thống bị xoay tua dồn dập $\ge 4$ lần trong vòng 60 giây.
+
+### 8. Triệt Tiêu Cây Tiến Trình Con Cháu & Chống Zombie (`is_tree_dead`)
+- Tách biệt Session Leader (`preexec_fn=os.setsid`) để cô lập Process Group của tiến trình con.
+- Thuật toán `kill_process_tree()` theo dõi danh sách toàn bộ `known_descendants` và leo thang tín hiệu tuần tự (`SIGINT` $\to$ `SIGTERM` $\to$ `SIGKILL`), đảm bảo dọn sạch 100% tiến trình con cháu ngầm mà Supervisor không bao giờ bị tự hủy.
+
+### 9. Cách Ly Phiên SQLite WAL & Khử Dấu Vết Bot (Anti-Sybil Jitter)
+- Cơ chế `fork_conversation()` sao chép SQLite an toàn qua URI Read-Only và `backup(dst_conn)`, đồng bộ cả 3 tệp (`.vscdb`, `.vscdb-wal`, `.vscdb-shm`) và tự động sinh Trajectory UUID mới khi đổi slot để phá vỡ mối liên kết phân tích hành vi của Google (`abuse.pi`).
+- Tạo độ trễ ngẫu nhiên thích ứng `2.0s` đến `5.0s` giữa mỗi lần chuyển slot.
+
+### 10. Kiểm Thực Khán Giả Token & Bảo Vệ Client ID (`AudienceValidator`)
+- Tự động giải mã payload JWT `id_token` để thẩm định trường `aud` / `azp`.
+- Chủ động phát hiện và cách ly các token có nguồn gốc từ công cụ khác (như `@google/gemini-cli` với Client ID `681255809395`), ngăn ngừa lỗi 401 `unauthorized_client` và nguy cơ bị backend Google gắn cờ cảnh cáo.
+- Công cụ `SlotHealthProber` cho phép thăm dò hạn mức và kiểm tra kết nối qua endpoint `/v1internal:retrieveUserQuota` mà không tiêu hao prompt quota của người dùng.
+
 ---
 
 ## Kiểm thử & Chẩn đoán hệ thống (Testing & Diagnostics)
@@ -99,8 +124,11 @@ Binary thực thi được cài đặt vào `~/.local/bin/agy-supervisor` kèm a
 Repository tích hợp sẵn bộ công cụ tự động hóa qua Makefile:
 
 ```bash
-# Chạy bộ hồi quy kiểm thử (19 unit & integration tests, môi trường hermetic cách ly 100%)
+# Chạy bộ kiểm thử tự động (178 unit tests & 115 E2E tests, môi trường hermetic cách ly 100%)
 make test
+
+# Chạy toàn bộ bộ kiểm thử End-to-End hộp đen 4 tầng
+pytest tests/e2e/ -v
 
 # Thực hiện kiểm tra chẩn đoán môi trường, phân quyền, và tính hợp lệ của token
 make health
@@ -113,6 +141,7 @@ make verify
 
 ## Tài liệu kỹ thuật chi tiết (Documentation)
 
+- [docs/AGY_PROTOCOL_REVERSE_ENGINEERING.md](docs/AGY_PROTOCOL_REVERSE_ENGINEERING.md): Phân tích dịch ngược toàn diện ELF nhị phân, giao thức gRPC/ConnectRPC, Protobuf quota schema, và luồng xác thực Google Cloud Code.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Phân tích chi tiết về TTY Linux, thang tín hiệu, D-Bus Secret Service, và cơ chế SQLite WAL.
 - [docs/ANTI_ABUSE_GUIDE.md](docs/ANTI_ABUSE_GUIDE.md): Phân tích kỹ thuật về rate limiter của Google, chu kỳ reset Pacific Midnight, và các cơ chế phòng chống bị khóa tài khoản.
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): Hướng dẫn khắc phục khi Circuit Breaker kích hoạt, phiên SSH headless, và xung đột presence lock.

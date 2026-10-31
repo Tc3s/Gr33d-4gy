@@ -118,16 +118,17 @@ def run_live_verification():
 
     try:
         start_time = time.time()
-        quota_hit, reset_secs = sup.run_session([], is_continue=False)
+        quota_hit, reset_secs, is_daily = sup.run_session([], is_continue=False)
         elapsed = time.time() - start_time
 
         print(f"[+] Kết quả Phiên 1:")
         print(f"    - Quota Hit Detected: {quota_hit} (Thời gian phản hồi: {elapsed:.2f}s)")
         print(f"    - Quota Reset Trích xuất: {reset_secs}s ({reset_secs // 3600} giờ {(reset_secs % 3600) // 60} phút)")
+        print(f"    - Is Daily Quota: {is_daily}")
 
         if quota_hit:
             print("\n[2] Thực hiện xoay tua tài khoản:")
-            mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
+            mgr.mark_exhausted(curr_slot, reset_secs=reset_secs, is_daily=is_daily)
             new_slot = mgr.rotate_to_next()
             new_email = mod.extract_email_from_path(mgr.accounts_dir / new_slot)
             print(f"    - Đã chuyển sang Slot {new_slot} ({new_email})")
@@ -138,7 +139,7 @@ def run_live_verification():
 
             print("\n[3] Khởi chạy Phiên 2 (Tiếp nối với cờ -c & --dangerously-skip-permissions):")
             current_turn[0] = 2
-            quota_hit2, _ = sup.run_session([], is_continue=True)
+            quota_hit2, *_ = sup.run_session([], is_continue=True)
             print(f"    - Phiên 2 hoàn thành: Quota Hit = {quota_hit2}")
     finally:
         # Restore Popen

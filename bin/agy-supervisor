@@ -28,7 +28,22 @@ import base64
 import subprocess
 import threading
 import re
+import random
+import uuid
+import sqlite3
+import shutil
+import tempfile
+import math
+from collections import deque
 from pathlib import Path
+import urllib.request
+import urllib.parse
+import urllib.error
+import socket
+import http.client
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional, List, Set, Any, Dict, Tuple
 
 # Base Paths
 HOME = Path.home()
@@ -39,17 +54,209 @@ ACCOUNTS_DIR = HOME / ".gemini_accounts"
 STATE_FILE = ACCOUNTS_DIR / "supervisor_state.json"
 PRESENCE_DIR = CLI_DIR / "presence"
 
-# Quota Patterns
+# Milestone 2: Adaptive Handover Jitter & Anti-Abuse Spacing
+JITTER_MIN_SECONDS = 2.5
+JITTER_MAX_SECONDS = 5.0
+JITTER_BACKOFF_FACTOR = 1.5
+JITTER_MAX_BACKOFF_SECONDS = 30.0
+
+# Event Classification Types
+class LogEventType(str, Enum):
+    NONE = "EVENT_NONE"
+    QUOTA_EXHAUSTED = "EVENT_QUOTA_EXHAUSTED"
+    ACCOUNT_NOTICE = "EVENT_ACCOUNT_NOTICE"
+    AUTH_FAILURE = "EVENT_AUTH_FAILURE"
+    TRANSIENT_503 = "EVENT_TRANSIENT_503"
+    # Aliases
+    QUOTA_DAILY = "EVENT_QUOTA_EXHAUSTED"
+    QUOTA_RPM = "EVENT_QUOTA_EXHAUSTED"
+
+# Backward-compatible aliases matching PROJECT.md interface contract
+EVENT_NONE = LogEventType.NONE
+EVENT_QUOTA_EXHAUSTED = LogEventType.QUOTA_EXHAUSTED
+EVENT_QUOTA_DAILY = LogEventType.QUOTA_DAILY
+EVENT_QUOTA_RPM = LogEventType.QUOTA_RPM
+EVENT_ACCOUNT_NOTICE = LogEventType.ACCOUNT_NOTICE
+EVENT_AUTH_FAILURE = LogEventType.AUTH_FAILURE
+EVENT_TRANSIENT_503 = LogEventType.TRANSIENT_503
+
+@dataclass
+class LogEventClassification:
+    event_type: LogEventType
+    raw_line: bytes = b""
+    message: str = ""
+    reset_seconds: int = 0
+    is_daily: bool = False
+    status_code: Optional[int] = None
+    reason: str = ""
+    raw_match: str = ""
+
+    def __post_init__(self):
+        if not self.raw_match and self.raw_line:
+            self.raw_match = self.raw_line.decode("utf-8", errors="ignore")
+        elif not self.raw_line and self.raw_match:
+            self.raw_line = self.raw_match.encode("utf-8")
+        if not self.message:
+            self.message = self.reason
+
+    @property
+    def is_quota(self) -> bool:
+        return self.event_type in (
+            LogEventType.QUOTA_EXHAUSTED,
+            "EVENT_QUOTA_EXHAUSTED",
+            "QUOTA_EXHAUSTED",
+            "QUOTA_DAILY",
+            "QUOTA_RPM",
+            "EVENT_QUOTA_DAILY",
+            "EVENT_QUOTA_RPM",
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.is_quota or self.is_suspension
+
+    @property
+    def is_suspension(self) -> bool:
+        return self.event_type in (
+            LogEventType.ACCOUNT_NOTICE,
+            LogEventType.AUTH_FAILURE,
+            "EVENT_ACCOUNT_NOTICE",
+            "EVENT_AUTH_FAILURE",
+            "ACCOUNT_NOTICE",
+            "AUTH_FAILURE",
+        )
+
+    @property
+    def is_transient(self) -> bool:
+        return self.event_type in (
+            LogEventType.TRANSIENT_503,
+            "EVENT_TRANSIENT_503",
+            "TRANSIENT_503",
+        )
+
+    @property
+    def is_fatal(self) -> bool:
+        return self.is_terminal
+
+    @property
+    def should_terminate(self) -> bool:
+        return self.is_terminal
+
+    @property
+    def should_rotate(self) -> bool:
+        return self.is_terminal
+
+    def __bool__(self) -> bool:
+        return self.event_type not in (LogEventType.NONE, "EVENT_NONE", "NONE")
+
+class SessionResult(tuple):
+    """
+    3-tuple subclass for backward compatibility:
+    Allows unpacking: quota_hit, reset_secs, is_daily = run_session(...)
+    While also providing access to .event, .classification, .hit, .reset_secs, .is_daily, .event_detected.
+    """
+    def __new__(cls, hit: bool, reset_secs: int, is_daily: bool, event: Optional[LogEventClassification] = None):
+        instance = super().__new__(cls, (hit, reset_secs, is_daily))
+        instance.hit = hit
+        instance.reset_secs = reset_secs
+        instance.is_daily = is_daily
+        instance.event = event
+        instance.classification = event
+        instance.event_detected = hit
+        return instance
+
+# Pattern Constants
 TRUE_TERMINAL_QUOTA_PATTERNS = [
-    b"You have exhausted your quota on this model",
-    b"image generation quota exceeded"
+    b"you have exhausted your quota on this model",
+    b"individual quota reached",
+    b"image generation quota exceeded",
+    b"model capacity exhausted",
+    b"model_capacity_exhausted",
+    b"quota exceeded",
 ]
 
-FALSE_POSITIVE_PATTERNS = [
-    b"doRefreshQuota: skipped",
+BENIGN_FALSE_POSITIVE_PATTERNS = [
+    b"dorefreshquota: skipped",
     b"starting reload",
     b"exhausted iterator",
+    b"continuous pprof profiling is disabled",
+    b"migration [",
+    b"clearcut dropped",
 ]
+FALSE_POSITIVE_PATTERNS = BENIGN_FALSE_POSITIVE_PATTERNS
+
+TRANSIENT_503_PATTERNS = [
+    b"no capacity available for model",
+    b"no capacity available on the server",
+    b"503 service unavailable",
+    b"(code 503)",
+    b"status code: 503",
+    b'"code": 503',
+    b"http/2.0 503",
+    b"http/1.1 503",
+    b"http 503",
+    b"code = unavailable",
+    b"desc = service unavailable",
+    b"desc = no capacity available",
+]
+
+ACCOUNT_NOTICE_PATTERNS = [
+    (b"your account is blocked due to a terms of service violation", "Terms of Service violation block"),
+    (b"terms of service violation", "Terms of Service violation"),
+    (b"violates our terms of service", "Terms of Service violation"),
+    (b"policy violation", "Google Policy violation"),
+    (b"account is temporarily disabled", "Account temporarily disabled"),
+    (b"user account is disabled", "User account disabled"),
+    (b"user notice: please accept the updated terms", "Updated terms required"),
+    (b"ineligible tier or account suspended", "Ineligible tier or account suspended"),
+    (b"ineligible tier", "Ineligible tier"),
+    (b"account suspended", "Account suspended"),
+    (b"your account has been suspended", "Account suspended"),
+    (b"usertier_privacynotice", "Privacy Notice / Tier restriction"),
+    (b"abuse.pi:antigravity_identity", "Google Anti-Abuse trigger flag"),
+    (b"admin_suspended", "Account suspended by admin"),
+    (b"parent_suspended", "Parent account suspended"),
+    (b"ineligibleinfo", "Ineligible account info"),
+    (b"toserrorinfo", "Terms of Service error info"),
+]
+
+AUTH_401_PATTERNS = [
+    (b"unauthorized_client", "unauthorized_client"),
+    (b"you are not logged into antigravity", "Not logged into Antigravity"),
+    (b"error getting token source", "Missing/invalid token source"),
+    (b"token_revoked", "Token revoked"),
+    (b"token has been revoked", "Token revoked"),
+    (b"invalid_grant", "Invalid OAuth grant"),
+    (b"code = unauthenticated", "gRPC UNAUTHENTICATED"),
+    (b"probe_status_unauthenticated", "gRPC UNAUTHENTICATED"),
+    (b"status code: 401", "HTTP 401 Unauthorized"),
+    (b"(code 401)", "HTTP 401 Unauthorized"),
+    (b'"code": 401', "HTTP 401 Unauthorized"),
+    (b"http/2.0 401", "HTTP 401 Unauthorized"),
+    (b"http/1.1 401", "HTTP 401 Unauthorized"),
+    (b"http/2 401", "HTTP 401 Unauthorized"),
+    (b"http 401", "HTTP 401 Unauthorized"),
+    (b"401 unauthorized", "HTTP 401 Unauthorized"),
+]
+
+AUTH_403_PATTERNS = [
+    (b"code = permissiondenied", "gRPC PERMISSION_DENIED"),
+    (b"code = permission_denied", "gRPC PERMISSION_DENIED"),
+    (b"desc = permission_denied", "gRPC PERMISSION_DENIED"),
+    (b"desc = permissiondenied", "gRPC PERMISSION_DENIED"),
+    (b"permission_denied", "PERMISSION_DENIED"),
+    (b"credential_revoked", "Credential revoked"),
+    (b"subscription_required", "Subscription required / license missing"),
+    (b"status code: 403", "HTTP 403 Forbidden"),
+    (b"(code 403)", "HTTP 403 Forbidden"),
+    (b'"code": 403', "HTTP 403 Forbidden"),
+    (b"http/2.0 403", "HTTP 403 Forbidden"),
+    (b"http/1.1 403", "HTTP 403 Forbidden"),
+    (b"http/2 403", "HTTP 403 Forbidden"),
+    (b"http 403", "HTTP 403 Forbidden"),
+    (b"403 forbidden", "HTTP 403 Forbidden"),
+]
+
 
 # D-Bus Keyring Helper Functions (for GNOME Keyring / Secret Service)
 try:
@@ -150,26 +357,1028 @@ except ImportError:
     def set_keyring_secret(secret_str: str): return False
     def delete_keyring_secret(): return False
 
-def is_genuine_quota_log(chunk: bytes) -> bool:
-    for line in chunk.split(b"\n"):
-        if any(fp in line for fp in FALSE_POSITIVE_PATTERNS):
-            continue
-        if b"You have exhausted your quota on this model" in line:
-            return True
-        if b"RESOURCE_EXHAUSTED" in line:
-            return True
-        if b"status code: 429" in line or b'"code": 429' in line:
-            return True
-        if b"model capacity exhausted" in line or b"image generation quota exceeded" in line:
-            return True
-        if b"503" in line and (b"Service Unavailable" in line or b"Overloaded" in line or b"overloaded" in line):
-            return True
-        if b"code = Unavailable" in line or (b"UNAVAILABLE" in line and b"14" in line):
-            return True
+# ==============================================================================
+# FEATURE F8: TOKEN AUDIENCE & CLIENT ID GUARD ARCHITECTURE (PURE PYTHON)
+# ==============================================================================
+
+class ClientIDStatus(str, Enum):
+    """Classification of Google OAuth Client ID / Audience validity."""
+    VALID = "VALID"                           # Matches verified native Antigravity client ID
+    FOREIGN_MISMATCH = "FOREIGN_MISMATCH"     # Belongs to a known foreign Google app (e.g. gemini-cli)
+    UNKNOWN_CLIENT = "UNKNOWN_CLIENT"         # Unrecognized third-party or arbitrary client ID
+    MISSING_TOKEN = "MISSING_TOKEN"           # Missing id_token or client_id in credentials
+    MALFORMED_JWT = "MALFORMED_JWT"           # Corrupted base64 or invalid JSON payload
+
+@dataclass
+class TokenAudienceReport:
+    """Detailed diagnostic report produced by AudienceValidator."""
+    status: ClientIDStatus
+    client_id: Optional[str]
+    project_number: Optional[str]
+    aud: Optional[str]
+    azp: Optional[str]
+    email: Optional[str]
+    issuer: Optional[str]
+    expires_at: Optional[int]
+    app_name: str
+    is_safe_to_activate: bool
+    diagnostic_message: str
+    remediation_command: str
+
+def _sec(h: str) -> str:
+    return bytes(x ^ 0x5A for x in bytes.fromhex(h)).decode("ascii")
+
+TRUSTED_AGY_CLIENT_IDS: Dict[str, Dict[str, Any]] = {
+    # 1. Primary Antigravity CLI & Desktop IDE Client ID (offset 0x5dd2284 in agy)
+    _sec("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "1071006060591",
+        "app_name": "Antigravity CLI / Desktop IDE (Primary)",
+        "trusted": True
+    },
+    # 2. Secondary Antigravity Web / Auth Flow / Cloud Code Client ID (offset 0x5dcfa94 in agy)
+    _sec("62626e696f6e636b636a6f6877696c2e28396b303038692e3d2f333b396968352c6c39353e686c62396f383632743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "884354919052",
+        "app_name": "Antigravity Auth / Cloud Code PA (Secondary)",
+        "trusted": True
+    },
+    # 3. Antigravity BAIC Telemetry & MCP Client ID (offset 0x5dd2483 in agy)
+    _sec("6b6a636263636b6b6d6f6d686f77373e2f6b353f6f3938383f6b39313d3d293f38353832636e2e35333b2a6c6f6d743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "1098991175725",
+        "app_name": "Antigravity BAIC Telemetry / MCP (Internal)",
+        "trusted": True
+    }
+}
+
+KNOWN_FOREIGN_CLIENT_IDS: Dict[str, Dict[str, Any]] = {
+    # Google Gemini CLI public OAuth client
+    _sec("6c626b686f6f626a6369636f773535623c2e68352a283e28342a633f693b2b3c6c3b2c6932373e33386b696f30743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "681255809395",
+        "app_name": "gemini-cli (@google/gemini-cli)",
+        "trusted": False,
+        "description": "Google Gemini CLI public client. Incompatible with Antigravity binary token refresh."
+    },
+    # Google Cloud SDK (gcloud CLI) default client
+    _sec("69686f6f6f636e6a6f6f63743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "32555940559",
+        "app_name": "Google Cloud SDK (gcloud CLI)",
+        "trusted": False,
+        "description": "gcloud CLI default client. Incompatible with Antigravity binary."
+    },
+    # Firebase CLI tools client
+    _sec("6f6c696f626e69696f626c63773c3d28323d373e6e6d382b343f3133306f3362386f2a286a693235626f633f6b743b2a2a29743d35353d363f2f293f283935342e3f342e74393537"): {
+        "project_number": "563584335869",
+        "app_name": "Firebase CLI",
+        "trusted": False,
+        "description": "Firebase tools client. Incompatible with Antigravity binary."
+    }
+}
+
+TRUSTED_PROJECT_NUMBERS: Set[str] = {
+    info["project_number"] for info in TRUSTED_AGY_CLIENT_IDS.values()
+}
+
+FOREIGN_PROJECT_NUMBERS: Set[str] = {
+    info["project_number"] for info in KNOWN_FOREIGN_CLIENT_IDS.values()
+}
+
+def atomic_write_json(target_path: Path, data: Any, mode: int = 0o600) -> bool:
+    """Atomically writes JSON serializable data to target_path using a temporary file and os.replace."""
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, target_path)
+        return True
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
+
+def atomic_copy_file(src_path: Path, dst_path: Path, mode: int = 0o600) -> bool:
+    """Atomically copies src_path to dst_path using a temporary file and os.replace."""
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    if not src_path.exists():
+        return False
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst_path.with_name(f"{dst_path.name}.{os.getpid()}.tmp")
+    try:
+        with open(src_path, "rb") as f_in, open(tmp_path, "wb") as f_out:
+            f_out.write(f_in.read())
+            f_out.flush()
+            os.fsync(f_out.fileno())
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, dst_path)
+        return True
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
+
+def safe_load_json_file(file_path: Path) -> Dict[str, Any]:
+    """Safely loads a JSON dictionary from file_path, returning {} on error or missing file."""
+    file_path = Path(file_path)
+    if not file_path.exists():
+        return {}
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace").strip()
+        if not content:
+            return {}
+        val = json.loads(content)
+        return val if isinstance(val, dict) else {}
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
+
+
+def decode_base64url_json(segment: str) -> Optional[Dict[str, Any]]:
+    """Decodes a base64url-encoded string (RFC 7515) to a JSON dict with unpadded support."""
+    if not segment or not isinstance(segment, str):
+        return None
+    s = segment.strip()
+    rem = len(s) % 4
+    if rem > 0:
+        s += "=" * (4 - rem)
+    try:
+        raw_bytes = base64.urlsafe_b64decode(s)
+        decoded_text = raw_bytes.decode("utf-8", errors="replace")
+        parsed = json.loads(decoded_text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+def parse_jwt_claims(jwt_token: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Safely unpacks unverified JWT payload claims (RFC 7519)."""
+    if not jwt_token or not isinstance(jwt_token, str):
+        return None, "Empty or non-string JWT token"
+    parts = jwt_token.strip().split(".")
+    if len(parts) != 3:
+        return None, f"Malformed JWT: expected 3 dot-separated segments, got {len(parts)}"
+    payload = decode_base64url_json(parts[1])
+    if payload is None:
+        return None, "Failed to decode JWT payload JSON"
+    return payload, None
+
+def extract_project_number(client_id_or_aud: Optional[str]) -> Optional[str]:
+    """Extracts the numeric Google Cloud project number prefix from a client_id or aud string."""
+    if not client_id_or_aud or not isinstance(client_id_or_aud, str):
+        return None
+    s = client_id_or_aud.strip()
+    m = re.match(r"^(\d+)(?:-[a-zA-Z0-9_\-]+)?(?:\.apps\.googleusercontent\.com)?$", s, re.IGNORECASE)
+    return m.group(1) if m else None
+
+class AudienceValidator:
+    """Pure Python standard library token audience and Client ID guard."""
+
+    @classmethod
+    def validate_credentials_dict(cls, creds: Dict[str, Any], strict: bool = False) -> TokenAudienceReport:
+        if not isinstance(creds, dict):
+            return TokenAudienceReport(
+                status=ClientIDStatus.MISSING_TOKEN,
+                client_id=None,
+                project_number=None,
+                aud=None,
+                azp=None,
+                email=None,
+                issuer=None,
+                expires_at=None,
+                app_name="Unknown",
+                is_safe_to_activate=False,
+                diagnostic_message="Empty or invalid credentials data structure",
+                remediation_command="agy-supervisor login <slot>"
+            )
+
+        # 1. Locate and sanitize id_token (top-level or nested under 'token')
+        raw_id_token = creds.get("id_token")
+        if not raw_id_token and isinstance(creds.get("token"), dict):
+            raw_id_token = creds["token"].get("id_token")
+        id_token_str = str(raw_id_token).strip() if (raw_id_token and isinstance(raw_id_token, str)) else None
+
+        # 2. Locate and sanitize explicit client_id (defend against non-string unhashable types)
+        raw_client_id = creds.get("client_id")
+        if not raw_client_id and isinstance(creds.get("token"), dict):
+            raw_client_id = creds["token"].get("client_id")
+
+        if raw_client_id is not None and not isinstance(raw_client_id, str):
+            return TokenAudienceReport(
+                status=ClientIDStatus.MALFORMED_JWT,
+                client_id=None,
+                project_number=None,
+                aud=None,
+                azp=None,
+                email=creds.get("id_token_email") or creds.get("email"),
+                issuer=None,
+                expires_at=None,
+                app_name="Malformed Credentials",
+                is_safe_to_activate=False,
+                diagnostic_message=f"Corrupt client_id field in credentials: expected str, got {type(raw_client_id).__name__}",
+                remediation_command="agy-supervisor login <slot>"
+            )
+
+        explicit_client_id = raw_client_id.strip() if (raw_client_id and isinstance(raw_client_id, str)) else None
+        if explicit_client_id == "":
+            explicit_client_id = None
+
+        if not id_token_str and not explicit_client_id:
+            email_hint = creds.get("id_token_email") or creds.get("email")
+            return TokenAudienceReport(
+                status=ClientIDStatus.MISSING_TOKEN,
+                client_id=None,
+                project_number=None,
+                aud=None,
+                azp=None,
+                email=email_hint,
+                issuer=None,
+                expires_at=None,
+                app_name="Mock / Unverified Token",
+                is_safe_to_activate=not strict,
+                diagnostic_message="No id_token or client_id found in credentials to verify audience",
+                remediation_command="agy-supervisor login <slot>"
+            )
+
+        # 3. Parse JWT id_token if available
+        claims: Dict[str, Any] = {}
+        if id_token_str:
+            parsed_claims, err = parse_jwt_claims(id_token_str)
+            if err:
+                return TokenAudienceReport(
+                    status=ClientIDStatus.MALFORMED_JWT,
+                    client_id=explicit_client_id,
+                    project_number=extract_project_number(explicit_client_id) if explicit_client_id else None,
+                    aud=None,
+                    azp=None,
+                    email=creds.get("id_token_email") or creds.get("email"),
+                    issuer=None,
+                    expires_at=None,
+                    app_name="Malformed Token",
+                    is_safe_to_activate=False,
+                    diagnostic_message=f"Corrupt or malformed JWT id_token: {err}",
+                    remediation_command="agy-supervisor login <slot>"
+                )
+            claims = parsed_claims if isinstance(parsed_claims, dict) else {}
+
+        # 4. Resolve all elements of aud and azp
+        aud_val = claims.get("aud")
+        audiences: List[str] = []
+        if isinstance(aud_val, list):
+            for item in aud_val:
+                if isinstance(item, (str, int)):
+                    s = str(item).strip()
+                    if s and s not in audiences:
+                        audiences.append(s)
+        elif isinstance(aud_val, (str, int)):
+            s = str(aud_val).strip()
+            if s and s not in audiences:
+                audiences.append(s)
+
+        aud_str = audiences[0] if audiences else None
+        azp_val = claims.get("azp")
+        azp_str = str(azp_val).strip() if (azp_val and isinstance(azp_val, (str, int))) else None
+        email_str = claims.get("email") if isinstance(claims.get("email"), str) else (creds.get("id_token_email") or creds.get("email"))
+        issuer_str = str(claims.get("iss")) if claims.get("iss") else None
+        exp_int = claims.get("exp") if isinstance(claims.get("exp"), int) else None
+
+        # Foreign matcher helper
+        def match_foreign(cid: Optional[str]) -> Optional[Dict[str, Any]]:
+            if not cid or not isinstance(cid, str):
+                return None
+            if cid in KNOWN_FOREIGN_CLIENT_IDS:
+                return KNOWN_FOREIGN_CLIENT_IDS[cid]
+            p_num = extract_project_number(cid)
+            if p_num:
+                for fc_info in KNOWN_FOREIGN_CLIENT_IDS.values():
+                    if fc_info.get("project_number") == p_num:
+                        return fc_info
+            for prefix in FOREIGN_PROJECT_NUMBERS:
+                if cid.startswith(prefix):
+                    for fc_info in KNOWN_FOREIGN_CLIENT_IDS.values():
+                        if fc_info.get("project_number") == prefix:
+                            return fc_info
+                    return {"app_name": f"Foreign Client ({prefix})", "project_number": prefix}
+            return None
+
+        # Collect all cryptographic candidate IDs from id_token
+        jwt_candidates: List[str] = list(audiences)
+        if azp_str and azp_str not in jwt_candidates:
+            jwt_candidates.append(azp_str)
+
+        # 5. Cryptographic foreign check: if ANY claim in id_token matches a foreign client, REJECT!
+        for cand in jwt_candidates:
+            f_match = match_foreign(cand)
+            if f_match:
+                cand_proj = extract_project_number(cand) or f_match.get("project_number")
+                app = f_match.get("app_name", "Foreign Client")
+                diag = (
+                    f"FOREIGN TOKEN CORRUPTION: Token was minted for Google client '{app}' "
+                    f"(Client Project: {cand_proj or 'unknown'}). "
+                    f"The Antigravity CLI binary only trusts Antigravity client IDs "
+                    f"(1071006060591 / 884354919052). Attempting to use this token triggers "
+                    f"HTTP 401 unauthorized_client on refresh and risks Google abuse notices."
+                )
+                return TokenAudienceReport(
+                    status=ClientIDStatus.FOREIGN_MISMATCH,
+                    client_id=cand,
+                    project_number=cand_proj,
+                    aud=aud_str,
+                    azp=azp_str,
+                    email=email_str,
+                    issuer=issuer_str,
+                    expires_at=exp_int,
+                    app_name=app,
+                    is_safe_to_activate=False,
+                    diagnostic_message=diag,
+                    remediation_command="agy-supervisor login <slot>"
+                )
+
+        # 6. Check explicit_client_id against foreign
+        if explicit_client_id:
+            f_match = match_foreign(explicit_client_id)
+            if f_match:
+                exp_proj = extract_project_number(explicit_client_id) or f_match.get("project_number")
+                app = f_match.get("app_name", "Foreign Client")
+                diag = (
+                    f"FOREIGN TOKEN CORRUPTION: Credentials contain foreign client_id '{app}' "
+                    f"(Client Project: {exp_proj or 'unknown'})."
+                )
+                return TokenAudienceReport(
+                    status=ClientIDStatus.FOREIGN_MISMATCH,
+                    client_id=explicit_client_id,
+                    project_number=exp_proj,
+                    aud=aud_str,
+                    azp=azp_str,
+                    email=email_str,
+                    issuer=issuer_str,
+                    expires_at=exp_int,
+                    app_name=app,
+                    is_safe_to_activate=False,
+                    diagnostic_message=diag,
+                    remediation_command="agy-supervisor login <slot>"
+                )
+
+        # 7. Evaluate Antigravity trust when id_token is present
+        if jwt_candidates:
+            trusted_client_id = None
+            trusted_info = None
+            check_list = [azp_str] + [c for c in audiences if c != azp_str] if azp_str else audiences
+            for cand in check_list:
+                if cand in TRUSTED_AGY_CLIENT_IDS:
+                    trusted_client_id = cand
+                    trusted_info = TRUSTED_AGY_CLIENT_IDS[cand]
+                    break
+                p_num = extract_project_number(cand)
+                if p_num in TRUSTED_PROJECT_NUMBERS:
+                    trusted_client_id = cand
+                    trusted_info = {
+                        "project_number": p_num,
+                        "app_name": "Antigravity Ecosystem Client",
+                        "trusted": True
+                    }
+                    break
+
+            if trusted_client_id:
+                if explicit_client_id:
+                    exp_proj = extract_project_number(explicit_client_id)
+                    if exp_proj and exp_proj not in TRUSTED_PROJECT_NUMBERS:
+                        diag = (
+                            f"CONFLICTING CLIENT ID: id_token has trusted Antigravity audience "
+                            f"but explicit client_id '{explicit_client_id}' belongs to untrusted project '{exp_proj}'."
+                        )
+                        return TokenAudienceReport(
+                            status=ClientIDStatus.UNKNOWN_CLIENT,
+                            client_id=explicit_client_id,
+                            project_number=exp_proj,
+                            aud=aud_str,
+                            azp=azp_str,
+                            email=email_str,
+                            issuer=issuer_str,
+                            expires_at=exp_int,
+                            app_name="Conflicting Client ID",
+                            is_safe_to_activate=False,
+                            diagnostic_message=diag,
+                            remediation_command="agy-supervisor login <slot>"
+                        )
+
+                app_name = trusted_info["app_name"]
+                return TokenAudienceReport(
+                    status=ClientIDStatus.VALID,
+                    client_id=trusted_client_id,
+                    project_number=trusted_info["project_number"],
+                    aud=aud_str,
+                    azp=azp_str,
+                    email=email_str,
+                    issuer=issuer_str,
+                    expires_at=exp_int,
+                    app_name=app_name,
+                    is_safe_to_activate=True,
+                    diagnostic_message=f"Verified native Antigravity client ({app_name})",
+                    remediation_command=""
+                )
+            else:
+                first_cand = jwt_candidates[0]
+                cand_proj = extract_project_number(first_cand)
+                diag = (
+                    f"UNKNOWN CLIENT ID: Token audience / client ID '{first_cand}' is not recognized. "
+                    f"Antigravity CLI only operates with verified Google OAuth client IDs."
+                )
+                return TokenAudienceReport(
+                    status=ClientIDStatus.UNKNOWN_CLIENT,
+                    client_id=first_cand,
+                    project_number=cand_proj,
+                    aud=aud_str,
+                    azp=azp_str,
+                    email=email_str,
+                    issuer=issuer_str,
+                    expires_at=exp_int,
+                    app_name="Unknown Google OAuth App",
+                    is_safe_to_activate=False,
+                    diagnostic_message=diag,
+                    remediation_command="agy-supervisor login <slot>"
+                )
+
+        # 8. Fallback to explicit client_id when id_token is absent
+        if explicit_client_id:
+            if explicit_client_id in TRUSTED_AGY_CLIENT_IDS:
+                info = TRUSTED_AGY_CLIENT_IDS[explicit_client_id]
+                return TokenAudienceReport(
+                    status=ClientIDStatus.VALID,
+                    client_id=explicit_client_id,
+                    project_number=info["project_number"],
+                    aud=None,
+                    azp=None,
+                    email=email_str,
+                    issuer=None,
+                    expires_at=None,
+                    app_name=info["app_name"],
+                    is_safe_to_activate=True,
+                    diagnostic_message=f"Verified native Antigravity client ({info['app_name']})",
+                    remediation_command=""
+                )
+            exp_proj = extract_project_number(explicit_client_id)
+            if exp_proj in TRUSTED_PROJECT_NUMBERS:
+                return TokenAudienceReport(
+                    status=ClientIDStatus.VALID,
+                    client_id=explicit_client_id,
+                    project_number=exp_proj,
+                    aud=None,
+                    azp=None,
+                    email=email_str,
+                    issuer=None,
+                    expires_at=None,
+                    app_name="Antigravity Ecosystem Client",
+                    is_safe_to_activate=True,
+                    diagnostic_message=f"Verified Antigravity project number ({exp_proj})",
+                    remediation_command=""
+                )
+            diag = f"UNKNOWN CLIENT ID: Token audience / client ID '{explicit_client_id}' is not recognized."
+            return TokenAudienceReport(
+                status=ClientIDStatus.UNKNOWN_CLIENT,
+                client_id=explicit_client_id,
+                project_number=exp_proj,
+                aud=None,
+                azp=None,
+                email=email_str,
+                issuer=None,
+                expires_at=None,
+                app_name="Unknown Google OAuth App",
+                is_safe_to_activate=False,
+                diagnostic_message=diag,
+                remediation_command="agy-supervisor login <slot>"
+            )
+
+        # 9. Fallback when neither jwt_candidates nor explicit_client_id exists
+        return TokenAudienceReport(
+            status=ClientIDStatus.UNKNOWN_CLIENT,
+            client_id=None,
+            project_number=None,
+            aud=aud_str,
+            azp=azp_str,
+            email=email_str,
+            issuer=issuer_str,
+            expires_at=exp_int,
+            app_name="Unknown Google OAuth App",
+            is_safe_to_activate=False,
+            diagnostic_message="No recognized audience or client_id found in credentials to verify",
+            remediation_command="agy-supervisor login <slot>"
+        )
+
+    @classmethod
+    def validate_slot(cls, slot_dir: Path, strict: bool = False) -> TokenAudienceReport:
+        oauth_file = slot_dir / "oauth_creds.json"
+        keyring_file = slot_dir / "keyring_secret.json"
+
+        if oauth_file.exists():
+            try:
+                data = json.loads(oauth_file.read_text(encoding="utf-8"))
+                report = cls.validate_credentials_dict(data, strict=strict)
+                if report.status in (ClientIDStatus.VALID, ClientIDStatus.FOREIGN_MISMATCH, ClientIDStatus.UNKNOWN_CLIENT):
+                    return report
+                if not keyring_file.exists():
+                    return report
+            except Exception as e:
+                return TokenAudienceReport(
+                    status=ClientIDStatus.MALFORMED_JWT,
+                    client_id=None,
+                    project_number=None,
+                    aud=None,
+                    azp=None,
+                    email=None,
+                    issuer=None,
+                    expires_at=None,
+                    app_name="Corrupt JSON",
+                    is_safe_to_activate=False,
+                    diagnostic_message=f"Corrupt oauth_creds.json: {e}",
+                    remediation_command="agy-supervisor login <slot>"
+                )
+
+        if keyring_file.exists():
+            try:
+                data = json.loads(keyring_file.read_text(encoding="utf-8"))
+                return cls.validate_credentials_dict(data, strict=strict)
+            except Exception as e:
+                return TokenAudienceReport(
+                    status=ClientIDStatus.MALFORMED_JWT,
+                    client_id=None,
+                    project_number=None,
+                    aud=None,
+                    azp=None,
+                    email=None,
+                    issuer=None,
+                    expires_at=None,
+                    app_name="Corrupt JSON",
+                    is_safe_to_activate=False,
+                    diagnostic_message=f"Corrupt keyring_secret.json: {e}",
+                    remediation_command="agy-supervisor login <slot>"
+                )
+
+        return TokenAudienceReport(
+            status=ClientIDStatus.MISSING_TOKEN,
+            client_id=None,
+            project_number=None,
+            aud=None,
+            azp=None,
+            email=None,
+            issuer=None,
+            expires_at=None,
+            app_name="Unconfigured",
+            is_safe_to_activate=False,
+            diagnostic_message="No credentials file found for slot",
+            remediation_command="agy-supervisor login <slot>"
+        )
+
+def format_diagnostic_box(slot: str, report: TokenAudienceReport) -> str:
+    """Formats a user-facing terminal diagnostic box for audience failures."""
+    lines = [
+        "\033[1;31m" + "=" * 75 + "\033[0m",
+        f"\033[1;31m[!] CREDENTIAL GUARD ERROR: SLOT {slot} TOKEN AUDIENCE INVALID\033[0m",
+        f"\033[1;33m[*] Account Email      : {report.email or 'Unknown'}\033[0m",
+        f"\033[1;33m[*] Client Status      : {report.status.value} ({report.app_name})\033[0m",
+        f"\033[1;33m[*] Detected Client ID : {report.client_id or 'None'}\033[0m",
+        f"\033[1;33m[*] Project Number     : {report.project_number or 'None'}\033[0m",
+        f"\033[1;31m[*] Diagnostic         : {report.diagnostic_message}\033[0m",
+        "",
+        "\033[1;36m💡 HƯỚNG DẪN KHẮC PHỤC (REMEDIATION):\033[0m",
+        f"   1. Chạy lệnh: \033[1;32magy-supervisor login {slot}\033[0m",
+        f"   2. Đăng nhập đúng tài khoản {report.email or 'Google'} trên trình duyệt Antigravity.",
+        f"   3. Sau khi xác thực, gõ /exit để supervisor tự động lưu token với Client ID hợp lệ.",
+        "   ⚠️  KHÔNG copy file oauth_creds.json từ gemini-cli hoặc các công cụ khác sang!",
+        "\033[1;31m" + "=" * 75 + "\033[0m"
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+# ==============================================================================
+# FEATURE F7: LIVE MULTI-SLOT CLOUD PROBING & OAUTH TOKEN REFRESH
+# ==============================================================================
+
+AGY_CONSUMER_CLIENT_ID = _sec("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")
+AGY_CONSUMER_CLIENT_SECRET = _sec("1d1519090a0277116f621c0d086e626c163e16106b371618622902196e206c2b1e1b3c")
+GEMINI_CLI_CLIENT_ID_PREFIX = "681255809395"
+
+CLOUDCODE_HOST_PRIMARY = "https://daily-cloudcode-pa.googleapis.com"
+CLOUDCODE_HOST_FALLBACK = "https://cloudcode-pa.googleapis.com"
+
+class SlotStatusType(str, Enum):
+    HEALTHY = "HEALTHY"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+    NOTICE_SUSPENDED = "NOTICE_SUSPENDED"
+    TOKEN_REVOKED = "TOKEN_REVOKED"
+    CLIENT_ID_MISMATCH = "CLIENT_ID_MISMATCH"
+    NETWORK_ERROR = "NETWORK_ERROR"
+
+@dataclass
+class SlotProbeResult:
+    slot: int
+    email: str
+    status: SlotStatusType
+    reset_seconds: int = 0
+    reset_timestamp: int = 0
+    tier: str = ""
+    gemini_remaining: float = 1.0
+    third_party_remaining: float = 1.0
+    notice_reason: str = ""
+    token_refreshed: bool = False
+    details: str = ""
+    audience_report: Optional[TokenAudienceReport] = None
+
+class SlotHealthProber:
+    """Non-destructive live health prober and OAuth token manager for supervisor slots."""
+
+    def __init__(self, accounts_dir: Path, is_active_slot_fn=None):
+        self.accounts_dir = accounts_dir
+        self.is_active_slot_fn = is_active_slot_fn
+
+    def is_slot_active(self, slot_id: int) -> bool:
+        if callable(self.is_active_slot_fn):
+            try:
+                return bool(self.is_active_slot_fn(slot_id))
+            except Exception:
+                pass
+        elif isinstance(self.is_active_slot_fn, (int, str)):
+            return str(self.is_active_slot_fn) == str(slot_id)
+        state_file = self.accounts_dir / "supervisor_state.json"
+        if state_file.exists():
+            try:
+                st = json.loads(state_file.read_text())
+                return str(st.get("current_slot")) == str(slot_id)
+            except Exception:
+                pass
+        return False
+
+    def _parse_iso_to_epoch(self, iso_str: str) -> int:
+        try:
+            clean = iso_str.replace("Z", "+00:00")
+            return int(datetime.datetime.fromisoformat(clean).timestamp())
+        except Exception:
+            return 0
+
+    def _extract_slot_credentials(self, slot_id: int) -> Dict[str, Any]:
+        s_dir = self.accounts_dir / str(slot_id)
+        kf = s_dir / "keyring_secret.json"
+        of = s_dir / "oauth_creds.json"
+        gf = s_dir / "google_accounts.json"
+
+        kd = safe_load_json_file(kf)
+        od = safe_load_json_file(of)
+        gd = safe_load_json_file(gf)
+
+        email = gd.get("active") or kd.get("id_token_email")
+        if not email and "id_token" in od:
+            try:
+                parts = str(od.get("id_token", "")).split(".")
+                if len(parts) >= 2:
+                    claims = decode_base64url_json(parts[1])
+                    if claims and claims.get("email"):
+                        email = claims["email"]
+            except Exception:
+                pass
+
+        # Defend against {"token": null}
+        kd_token = kd.get("token") or {}
+        if not isinstance(kd_token, dict):
+            kd_token = {}
+
+        is_gemini_cli = False
+        for c in (kd_token, od):
+            if not isinstance(c, dict):
+                continue
+            idt = c.get("id_token", "")
+            if isinstance(idt, str) and "." in idt:
+                try:
+                    parts = idt.split(".")
+                    if len(parts) >= 2:
+                        claims = decode_base64url_json(parts[1])
+                        if claims:
+                            aud = str(claims.get("aud", ""))
+                            azp = str(claims.get("azp", ""))
+                            if GEMINI_CLI_CLIENT_ID_PREFIX in aud or GEMINI_CLI_CLIENT_ID_PREFIX in azp:
+                                is_gemini_cli = True
+                except Exception:
+                    pass
+            cid = str(c.get("client_id", ""))
+            if GEMINI_CLI_CLIENT_ID_PREFIX in cid:
+                is_gemini_cli = True
+
+        refresh_token = kd_token.get("refresh_token") or od.get("refresh_token")
+        access_token = kd_token.get("access_token") or od.get("access_token")
+
+        now = int(time.time())
+        is_expired = True
+        expiry_ts = 0
+        if "expiry" in kd_token and kd_token["expiry"]:
+            expiry_ts = self._parse_iso_to_epoch(str(kd_token["expiry"]))
+            is_expired = (expiry_ts <= now + 300)
+        elif "expiry_date" in od and od["expiry_date"]:
+            exp_val = od["expiry_date"]
+            if isinstance(exp_val, (int, float)) and math.isfinite(exp_val):
+                try:
+                    expiry_ts = int(exp_val) // 1000
+                except (ValueError, OverflowError):
+                    expiry_ts = 0
+            elif isinstance(exp_val, str) and exp_val.isdigit():
+                try:
+                    expiry_ts = int(exp_val) // 1000
+                except (ValueError, OverflowError):
+                    expiry_ts = 0
+            else:
+                try:
+                    expiry_ts = self._parse_iso_to_epoch(str(exp_val))
+                except (ValueError, OverflowError):
+                    expiry_ts = 0
+            is_expired = (expiry_ts <= now + 300)
+
+        return {
+            "email": email or "Unknown",
+            "refresh_token": refresh_token,
+            "access_token": access_token,
+            "is_expired": is_expired,
+            "is_gemini_cli": is_gemini_cli,
+            "keyring_file": kf,
+            "oauth_file": of,
+            "kd": kd,
+            "od": od
+        }
+
+    def refresh_slot_token(self, slot_id: int, creds: dict) -> Tuple[Optional[str], Optional[SlotStatusType], str]:
+        """Refreshes access token for a slot out-of-band and saves directly to slot files."""
+        refresh_token = creds.get("refresh_token")
+        if not refresh_token:
+            return None, SlotStatusType.TOKEN_REVOKED, "No refresh token found"
+
+        data = urllib.parse.urlencode({
+            "client_id": AGY_CONSUMER_CLIENT_ID,
+            "client_secret": AGY_CONSUMER_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }).encode("utf-8")
+
+        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                tok_data = json.loads(resp.read().decode("utf-8"))
+                new_access_token = tok_data["access_token"]
+                expires_in = tok_data.get("expires_in", 3599)
+                now = int(time.time())
+                expiry_dt = datetime.datetime.fromtimestamp(now + expires_in, tz=datetime.timezone.utc)
+                expiry_iso = expiry_dt.isoformat().replace("+00:00", "Z")
+
+                # Update slot JSON files non-destructively
+                s_dir = self.accounts_dir / str(slot_id)
+                kf = creds.get("keyring_file") or (s_dir / "keyring_secret.json")
+                kd = creds.get("kd") or {}
+                if not isinstance(kd, dict) or not kd:
+                    kd = {"auth_method": "consumer", "id_token_email": creds.get("email", "Unknown")}
+                if not isinstance(kd.get("token"), dict):
+                    kd["token"] = {}
+                kd["token"]["access_token"] = new_access_token
+                kd["token"]["token_type"] = "Bearer"
+                kd["token"]["refresh_token"] = refresh_token
+                kd["token"]["expiry"] = expiry_iso
+                kd["token"]["expires_in"] = expires_in
+                atomic_write_json(kf, kd)
+
+                of = creds.get("oauth_file") or (s_dir / "oauth_creds.json")
+                od = creds.get("od") or {}
+                if not isinstance(od, dict):
+                    od = {}
+                od["access_token"] = new_access_token
+                od["token_type"] = "Bearer"
+                od["refresh_token"] = refresh_token
+                od["expiry_date"] = (now + expires_in) * 1000
+                if "id_token" in tok_data:
+                    od["id_token"] = tok_data["id_token"]
+                atomic_write_json(of, od)
+
+                # If this slot is currently active in the supervisor, sync to ~/.gemini and Keyring
+                if self.is_slot_active(slot_id):
+                    atomic_write_json(GEMINI_DIR / "oauth_creds.json", od)
+                    try:
+                        set_keyring_secret(json.dumps(kd))
+                    except Exception:
+                        pass
+
+                return new_access_token, None, "Refreshed successfully"
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            if "unauthorized_client" in err_body or creds.get("is_gemini_cli"):
+                return None, SlotStatusType.CLIENT_ID_MISMATCH, "Client ID mismatch: token belongs to foreign client"
+            if "invalid_grant" in err_body:
+                return None, SlotStatusType.TOKEN_REVOKED, "Refresh token expired or revoked (invalid_grant)"
+            if e.code >= 500 or e.code == 429:
+                return None, SlotStatusType.NETWORK_ERROR, f"OAuth HTTP {e.code}: {err_body}"
+            return None, SlotStatusType.TOKEN_REVOKED, f"OAuth HTTP {e.code}: {err_body}"
+        except Exception as e:
+            return None, SlotStatusType.NETWORK_ERROR, f"Network error during token refresh: {e}"
+
+    def probe_slot(self, slot_id: int, live_probe: bool = True) -> SlotProbeResult:
+        """Evaluates slot standing, refreshes tokens if expired, and queries CloudCode."""
+        s_dir = self.accounts_dir / str(slot_id)
+        report = AudienceValidator.validate_slot(s_dir, strict=False)
+        creds = self._extract_slot_credentials(slot_id)
+        email = creds["email"] or (report.email if report else "Unknown")
+
+        if report.status == ClientIDStatus.FOREIGN_MISMATCH or creds.get("is_gemini_cli"):
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.CLIENT_ID_MISMATCH,
+                details=report.diagnostic_message or "OAuth credentials originated from foreign client",
+                audience_report=report
+            )
+
+        if not report.is_safe_to_activate:
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.CLIENT_ID_MISMATCH,
+                details=report.diagnostic_message or f"Client ID not safe to activate: {report.status.value}",
+                audience_report=report
+            )
+
+        if not live_probe:
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.HEALTHY,
+                details="Offline evaluation (cached credentials)",
+                audience_report=report
+            )
+
+        access_token = creds["access_token"]
+        refreshed = False
+        if creds["is_expired"] or not access_token:
+            new_tok, err_status, err_msg = self.refresh_slot_token(slot_id, creds)
+            if err_status:
+                return SlotProbeResult(slot=slot_id, email=email, status=err_status, details=err_msg, audience_report=report)
+            access_token = new_tok
+            refreshed = True
+
+        # Query 1: loadCodeAssist
+        standing_url = f"{CLOUDCODE_HOST_PRIMARY}/v1internal:loadCodeAssist"
+        req = urllib.request.Request(standing_url, data=b"{}", method="POST")
+        req.add_header("Authorization", f"Bearer {access_token}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "antigravity-cli")
+
+        tier_name = "Antigravity"
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                lca = json.loads(r.read().decode("utf-8"))
+                tier_name = lca.get("currentTier", {}).get("name", "Antigravity")
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="ignore")
+            if e.code in (400, 403) and any(k in err.lower() for k in ["terms of service", "notice", "suspended", "violation", "blocked"]):
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.NOTICE_SUSPENDED,
+                    notice_reason=f"Google ToS / Account Notice ({e.code}): {err[:200]}",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            if e.code == 403:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.NOTICE_SUSPENDED,
+                    notice_reason=f"Permission Denied / Account Blocked (403): {err[:200]}",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            if e.code == 401:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.TOKEN_REVOKED,
+                    details="HTTP 401 Unauthorized from CloudCode",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            if e.code == 429:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.QUOTA_EXHAUSTED,
+                    details="HTTP 429 Too Many Requests from CloudCode",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            if e.code >= 500:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR,
+                    details=f"CloudCode backend HTTP {e.code}",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR,
+                details=f"CloudCode HTTP {e.code}",
+                token_refreshed=refreshed, audience_report=report
+            )
+        except Exception as e:
+            return SlotProbeResult(slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR, details=str(e), audience_report=report)
+
+        # Query 2: retrieveUserQuota
+        quota_url = f"{CLOUDCODE_HOST_PRIMARY}/v1internal:retrieveUserQuota"
+        req_q = urllib.request.Request(quota_url, data=b"{}", method="POST")
+        req_q.add_header("Authorization", f"Bearer {access_token}")
+        req_q.add_header("Content-Type", "application/json")
+        req_q.add_header("User-Agent", "antigravity-cli")
+
+        gemini_min_rem = 1.0
+        tp_min_rem = 1.0
+        now = int(time.time())
+        max_reset_ts = 0
+
+        primary_models = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.8-flash-tiered", "gemini-3-flash", "gemini-3.8-flash-high"}
+        tp_models = {"claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"}
+
+        try:
+            with urllib.request.urlopen(req_q, timeout=5) as r:
+                qdata = json.loads(r.read().decode("utf-8"))
+                for b in qdata.get("buckets", []):
+                    mid = b.get("modelId", "")
+                    rem = float(b.get("remainingFraction", 1.0))
+                    rst = b.get("resetTime")
+                    if mid in primary_models or "gemini" in mid.lower():
+                        if rem < gemini_min_rem:
+                            gemini_min_rem = rem
+                        if rem <= 0.0 and rst and isinstance(rst, str):
+                            epoch = self._parse_iso_to_epoch(rst)
+                            if epoch > max_reset_ts:
+                                max_reset_ts = epoch
+                    elif mid in tp_models or "claude" in mid.lower() or "gpt" in mid.lower():
+                        if rem < tp_min_rem:
+                            tp_min_rem = rem
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                gemini_min_rem = 0.0
+                max_reset_ts = now + 3600
+            elif e.code in (400, 403) and any(k in e.read().decode("utf-8", errors="ignore").lower() for k in ["terms of service", "notice", "suspended", "violation", "blocked"]):
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.NOTICE_SUSPENDED,
+                    notice_reason=f"Google ToS / Account Notice ({e.code})",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            elif e.code == 401:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.TOKEN_REVOKED,
+                    details="HTTP 401 Unauthorized from CloudCode quota endpoint",
+                    token_refreshed=refreshed, audience_report=report
+                )
+            else:
+                return SlotProbeResult(
+                    slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR,
+                    details=f"CloudCode quota HTTP {e.code}",
+                    token_refreshed=refreshed, audience_report=report
+                )
+        except (urllib.error.URLError, socket.timeout, http.client.RemoteDisconnected, ConnectionError, OSError) as e:
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR,
+                details=f"Network error on quota query: {e}",
+                token_refreshed=refreshed, audience_report=report
+            )
+        except Exception as e:
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.NETWORK_ERROR,
+                details=f"Unexpected error on quota query: {e}",
+                token_refreshed=refreshed, audience_report=report
+            )
+
+        if gemini_min_rem <= 0.0:
+            if max_reset_ts <= now:
+                max_reset_ts = now + 3600
+                rem_sec = 3600
+            else:
+                rem_sec = max(0, max_reset_ts - now)
+            return SlotProbeResult(
+                slot=slot_id, email=email, status=SlotStatusType.QUOTA_EXHAUSTED,
+                reset_seconds=rem_sec, reset_timestamp=max_reset_ts,
+                gemini_remaining=gemini_min_rem, third_party_remaining=tp_min_rem,
+                tier=tier_name, token_refreshed=refreshed,
+                details=f"Primary Gemini models exhausted. Resets in {rem_sec // 3600}h {(rem_sec % 3600) // 60}m",
+                audience_report=report
+            )
+
+        return SlotProbeResult(
+            slot=slot_id, email=email, status=SlotStatusType.HEALTHY,
+            gemini_remaining=gemini_min_rem, third_party_remaining=tp_min_rem,
+            tier=tier_name, token_refreshed=refreshed,
+            details=f"Gemini {int(gemini_min_rem * 100)}% available" + (f", 3P models exhausted" if tp_min_rem <= 0 else ""),
+            audience_report=report
+        )
+
+
+def is_daily_quota(chunk: bytes, reset_secs: int = 0) -> bool:
+    """Classifies whether a quota exhaustion event is daily (RPD) or short-term rate limit (RPM)."""
+    if reset_secs >= 600:
+        return True
+    if reset_secs > 0 and reset_secs < 600:
+        return False
+    lower = chunk.lower()
+    if any(p in lower for p in TRUE_TERMINAL_QUOTA_PATTERNS):
+        return True
     return False
 
 def parse_reset_seconds(text: str) -> int:
-    m = re.search(r"Resets in (?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", text)
+    m = re.search(r"resets in (?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", text, re.IGNORECASE)
     if m and any(m.groups()):
         d = int(m.group(1) or 0)
         h = int(m.group(2) or 0)
@@ -179,6 +1388,161 @@ def parse_reset_seconds(text: str) -> int:
         if total > 0:
             return total
     return 0
+
+def _classify_single_line(line: bytes) -> LogEventClassification:
+    if not line or not line.strip():
+        return LogEventClassification(LogEventType.NONE, raw_line=line)
+
+    lower = line.lower()
+
+    # 1. Benign false positives
+    if any(fp in lower for fp in BENIGN_FALSE_POSITIVE_PATTERNS):
+        return LogEventClassification(LogEventType.NONE, raw_line=line)
+
+    # 2. Account Notice & Terms of Service blocks
+    for pattern, reason in ACCOUNT_NOTICE_PATTERNS:
+        if pattern in lower:
+            return LogEventClassification(
+                LogEventType.ACCOUNT_NOTICE,
+                raw_line=line,
+                message=f"Google Account Notice / Suspension: {reason}",
+                status_code=403,
+                reason=reason,
+            )
+
+    # 3. Authentication / Authorization Failures (401 / 403)
+    for pattern, reason in AUTH_401_PATTERNS:
+        if pattern in lower:
+            return LogEventClassification(
+                LogEventType.AUTH_FAILURE,
+                raw_line=line,
+                message=f"Authentication failure (401): {reason}",
+                status_code=401,
+                reason=reason,
+            )
+
+    for pattern, reason in AUTH_403_PATTERNS:
+        if pattern in lower:
+            return LogEventClassification(
+                LogEventType.AUTH_FAILURE,
+                raw_line=line,
+                message=f"Authorization failure (403): {reason}",
+                status_code=403,
+                reason=reason,
+            )
+
+    # 4. Genuine Quota Exhaustion (429 / RESOURCE_EXHAUSTED)
+    quota_matched = False
+    if any(p in lower for p in TRUE_TERMINAL_QUOTA_PATTERNS):
+        quota_matched = True
+    elif b"resource_exhausted" in lower or b"resourceexhausted" in lower:
+        if any(k in lower for k in [b"quota", b"limit", b"resets in", b"code = resourceexhausted", b"desc = resource_exhausted"]):
+            quota_matched = True
+    elif (
+        b"status code: 429" in lower
+        or b"status code = 429" in lower
+        or b'"code": 429' in lower
+        or b"(code 429)" in lower
+        or b"http 429" in lower
+        or b"http/2.0 429" in lower
+        or b"http/1.1 429" in lower
+        or b"http/2 429" in lower
+        or b"429 too many requests" in lower
+    ):
+        if any(k in lower for k in [b"quota", b"limit", b"rate", b"resets in", b"too many requests"]):
+            quota_matched = True
+
+    if quota_matched:
+        text = line.decode("utf-8", errors="ignore")
+        secs = parse_reset_seconds(text)
+        daily = is_daily_quota(line, secs)
+        return LogEventClassification(
+            LogEventType.QUOTA_EXHAUSTED,
+            raw_line=line,
+            message=f"Quota limit reached ({'Daily' if daily else 'RPM'})",
+            reset_seconds=secs,
+            is_daily=daily,
+            status_code=429,
+            reason="Individual quota reached" if daily else "Rate limit exceeded",
+        )
+
+    # 5. Transient 503 capacity overload (Must NOT terminate / rotate)
+    if any(p in lower for p in TRANSIENT_503_PATTERNS):
+        return LogEventClassification(
+            LogEventType.TRANSIENT_503,
+            raw_line=line,
+            message="Google server capacity overload (HTTP 503 / UNAVAILABLE)",
+            status_code=503,
+            reason="Server capacity unavailable; agy auto-retry in progress",
+        )
+
+    return LogEventClassification(LogEventType.NONE, raw_line=line)
+
+def classify_log_event(chunk: bytes) -> LogEventClassification:
+    """
+    Parses a log chunk (single or multi-line) and returns structured classification.
+    Prioritizes ACCOUNT_NOTICE > AUTH_FAILURE > QUOTA_DAILY > QUOTA_RPM > TRANSIENT_503 > NONE.
+    """
+    found_events = []
+    for line in chunk.split(b"\n"):
+        if not line.strip():
+            continue
+        ev = _classify_single_line(line)
+        if ev.event_type != LogEventType.NONE:
+            found_events.append(ev)
+
+    if not found_events:
+        return LogEventClassification(LogEventType.NONE, raw_line=chunk)
+
+    # Priority 1: ACCOUNT_NOTICE
+    for ev in found_events:
+        if ev.event_type in (LogEventType.ACCOUNT_NOTICE, "EVENT_ACCOUNT_NOTICE", "ACCOUNT_NOTICE"):
+            return ev
+
+    # Priority 2: AUTH_FAILURE
+    for ev in found_events:
+        if ev.event_type in (LogEventType.AUTH_FAILURE, "EVENT_AUTH_FAILURE", "AUTH_FAILURE"):
+            return ev
+
+    # Priority 3: QUOTA_DAILY
+    for ev in found_events:
+        if ev.is_quota and ev.is_daily:
+            return ev
+
+    # Priority 4: QUOTA_RPM
+    for ev in found_events:
+        if ev.is_quota and not ev.is_daily:
+            return ev
+
+    # Priority 5: TRANSIENT_503
+    for ev in found_events:
+        if ev.is_transient:
+            return ev
+
+    return found_events[0]
+
+def resolve_chunk_event(lines: List[bytes]) -> Optional[LogEventClassification]:
+    """
+    Evaluates a batch of complete log lines and returns the highest-priority
+    terminable event according to system precedence:
+    ACCOUNT_NOTICE (Rank 1) > AUTH_FAILURE (Rank 2) > QUOTA_DAILY (Rank 3) > QUOTA_RPM (Rank 4).
+    Returns None if no terminable event is detected or if only TRANSIENT_503/NONE are present.
+    """
+    if not lines:
+        return None
+    event = classify_log_event(b"\n".join(lines))
+    if event.should_terminate:
+        return event
+    return None
+
+def is_genuine_quota_log(chunk: bytes) -> bool:
+    """
+    Backward-compatible wrapper for existing test suite and callers.
+    Returns True ONLY for genuine quota exhaustion (QUOTA_DAILY or QUOTA_RPM).
+    Explicitly returns False for 503 transient overload, account notices, 
+    auth failures, and benign informational logs.
+    """
+    return classify_log_event(chunk).is_quota
 
 def extract_email_from_path(slot_path: Path) -> str:
     # 1. Try google_accounts.json
@@ -223,7 +1587,427 @@ def extract_email_from_path(slot_path: Path) -> str:
                     return str(decoded.get("email", "Unknown"))
         except Exception:
             pass
-    return "Chưa cấu hình"
+    return "Unknown"
+# =============================================================================
+# MILESTONE 2: ANTI-THRASHING CIRCUIT BREAKER & ADAPTIVE COOLING ENGINE
+# =============================================================================
+
+def calculate_handover_jitter(
+    consecutive_failovers: int = 0,
+    min_delay: float = JITTER_MIN_SECONDS,
+    max_delay: float = JITTER_MAX_SECONDS,
+    backoff_factor: float = JITTER_BACKOFF_FACTOR,
+    max_jitter: float = JITTER_MAX_BACKOFF_SECONDS
+) -> float:
+    """
+    Calculates randomized handover delay with progressive backoff:
+    t_base in [2.5s, 5.0s]. On consecutive failovers, scales by backoff_factor^k, capped at max_jitter.
+    """
+    try:
+        k = min(max(0, int(consecutive_failovers)), 10)
+    except (ValueError, TypeError, OverflowError):
+        k = 0
+    mult = backoff_factor ** k
+    low = min(max_jitter, min_delay * mult)
+    high = min(max_jitter, max_delay * mult)
+    if low >= high:
+        return low
+    return random.uniform(low, high)
+
+class CircuitState(str, Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+@dataclass
+class CircuitBreakerConfig:
+    window_seconds: float = 120.0
+    error_threshold: int = 3
+    base_cooling_seconds: float = 60.0
+    max_cooling_seconds: float = 86400.0
+    jitter_min: float = 2.5
+    jitter_max: float = 5.0
+    rotational_window: float = 60.0
+    max_rotations_per_window: int = 4
+
+class ThrashingCircuitBreaker:
+    """
+    Sliding-window circuit breaker protecting Google accounts against 4xx/429 thrashing storms.
+    Tracks error velocity across child processes and slots to eliminate the 57h lockout root cause.
+    """
+    def __init__(self, config: Optional[CircuitBreakerConfig] = None):
+        self.config = config or CircuitBreakerConfig()
+        self.history: List[tuple[float, LogEventClassification]] = []
+        self.consecutive_errors: int = 0
+        self.strike_count: int = 0
+        self.state: CircuitState = CircuitState.CLOSED
+        self.cooldown_until: float = 0.0
+        self.last_tripped_at: float = 0.0
+        self.trip_reason: str = ""
+        self._lock = threading.RLock()
+
+    def record_event(self, event: LogEventClassification, timestamp: Optional[float] = None) -> bool:
+        """
+        Ingests a classified log event.
+        Returns True if the circuit breaker tripped (transitioned to OPEN), False otherwise.
+        """
+        now = timestamp if timestamp is not None else time.time()
+        with self._lock:
+            # 1. Transient 503 overload and benign informational events NEVER count as thrashing errors
+            if event.is_transient or event.event_type in (LogEventType.NONE, "EVENT_NONE", "NONE"):
+                return self.is_open(now)
+
+            # 2. Prune events outside sliding window [now - W, now]
+            cutoff = now - self.config.window_seconds
+            self.history = [(t, ev) for t, ev in self.history if t >= cutoff]
+            self.consecutive_errors = min(self.consecutive_errors, len(self.history))
+
+            # 3. Check for 4xx / 429 / Auth / Notice / Quota failure
+            is_error = (
+                event.is_terminal 
+                or event.is_quota 
+                or (event.status_code is not None and 400 <= event.status_code < 500)
+            )
+
+            if is_error:
+                self.history.append((now, event))
+                self.consecutive_errors += 1
+
+                # Trip condition: density in window >= threshold OR consecutive streak >= threshold
+                if len(self.history) >= self.config.error_threshold or self.consecutive_errors >= self.config.error_threshold:
+                    self._trip(now, event)
+                    return True
+            else:
+                # Non-error event resets consecutive streak
+                self.consecutive_errors = 0
+
+            return self.is_open(now)
+
+    def _trip(self, now: float, trigger_event: LogEventClassification):
+        self.state = CircuitState.OPEN
+        self.strike_count += 1
+        self.last_tripped_at = now
+        self.history.clear()
+        self.consecutive_errors = 0
+
+        # Exponential backoff calculation: base * 2^(strike - 1)
+        exp_factor = 2 ** max(0, self.strike_count - 1)
+        base_delay = self.config.base_cooling_seconds * exp_factor
+        delay = min(self.config.max_cooling_seconds, base_delay)
+
+        # Anti-Abuse: Add randomized jitter to decorrelate retry bursts
+        jitter = (
+            random.uniform(self.config.jitter_min, self.config.jitter_max)
+            if self.config.jitter_max > self.config.jitter_min
+            else self.config.jitter_min
+        )
+        total_delay = delay + jitter
+
+        # Respect server-provided reset seconds if larger
+        if trigger_event.reset_seconds > 0 and trigger_event.reset_seconds > total_delay:
+            total_delay = float(trigger_event.reset_seconds) + jitter
+
+        self.cooldown_until = now + total_delay
+        self.trip_reason = (
+            f"4xx Thrashing Storm detected ({self.config.error_threshold} errors in "
+            f"{self.config.window_seconds:.0f}s, Strike #{self.strike_count}). "
+            f"Mandatory cooling for {total_delay:.1f}s: {trigger_event.reason or trigger_event.message}"
+        )
+
+    def is_open(self, now: Optional[float] = None) -> bool:
+        t = now if now is not None else time.time()
+        if self.state == CircuitState.OPEN:
+            if t >= self.cooldown_until:
+                self.state = CircuitState.HALF_OPEN
+                return False
+            return True
+        return False
+
+    def get_remaining_cooldown(self, now: Optional[float] = None) -> float:
+        t = now if now is not None else time.time()
+        return max(0.0, self.cooldown_until - t)
+
+    def _reset_locked(self):
+        """Internal lock-free reset used by public reset() and load_dict()."""
+        self.history.clear()
+        self.consecutive_errors = 0
+        self.strike_count = 0
+        self.state = CircuitState.CLOSED
+        self.cooldown_until = 0.0
+        self.last_tripped_at = 0.0
+        self.trip_reason = ""
+
+    def reset(self):
+        with self._lock:
+            self._reset_locked()
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            cd = self.cooldown_until if math.isfinite(self.cooldown_until) and self.cooldown_until >= 0.0 else 0.0
+            lt = self.last_tripped_at if math.isfinite(self.last_tripped_at) and self.last_tripped_at >= 0.0 else 0.0
+            return {
+                "strike_count": max(0, int(self.strike_count)),
+                "consecutive_errors": max(0, int(self.consecutive_errors)),
+                "state": self.state.value if hasattr(self.state, "value") else str(self.state),
+                "cooldown_until": float(cd),
+                "last_tripped_at": float(lt),
+                "trip_reason": str(self.trip_reason or ""),
+            }
+
+    @staticmethod
+    def _parse_non_negative_int(val: Any, default: int = 0) -> int:
+        if val is None:
+            return default
+        try:
+            res = int(float(val))
+            return max(0, res)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _parse_non_negative_float(val: Any, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            res = float(val)
+            if not math.isfinite(res) or res < 0.0:
+                return default
+            return res
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _parse_circuit_state(val: Any) -> CircuitState:
+        if isinstance(val, CircuitState):
+            return val
+        if isinstance(val, str):
+            clean = val.strip().upper()
+            try:
+                return CircuitState(clean)
+            except (ValueError, KeyError):
+                return CircuitState.CLOSED
+        return CircuitState.CLOSED
+
+    def load_dict(self, data: Any):
+        """
+        Defensively deserializes circuit breaker state from untrusted dictionary.
+        Guaranteed to never raise TypeError, ValueError, KeyError, or AttributeError,
+        and falls back to a clean reset under lock upon any anomaly.
+        """
+        with self._lock:
+            if not isinstance(data, dict):
+                self._reset_locked()
+                return
+            try:
+                self.strike_count = self._parse_non_negative_int(data.get("strike_count"), default=0)
+                self.consecutive_errors = self._parse_non_negative_int(data.get("consecutive_errors"), default=0)
+                self.state = self._parse_circuit_state(data.get("state"))
+                self.cooldown_until = self._parse_non_negative_float(data.get("cooldown_until"), default=0.0)
+                self.last_tripped_at = self._parse_non_negative_float(data.get("last_tripped_at"), default=0.0)
+                self.trip_reason = str(data.get("trip_reason") or "")
+                self.history.clear()
+            except (TypeError, ValueError, KeyError, AttributeError, Exception):
+                self._reset_locked()
+
+def _is_pid_alive(pid: int) -> bool:
+    """
+    Checks if a PID is actively alive (not dead and not in zombie/dead state).
+    Filters out zombie (Z) and dead (X) states from Linux /proc/<pid>/stat.
+    """
+    if not pid or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            content = f.read()
+            idx = content.rfind(")")
+            if idx != -1 and len(content) > idx + 2:
+                state = content[idx + 2]
+                if state in ("Z", "X"):
+                    return False
+    except FileNotFoundError:
+        return False
+    except Exception:
+        pass
+    return True
+
+
+def _is_pgid_alive(pgid: int) -> bool:
+    """
+    Checks if any process in the process group is alive.
+    Safe against pgid <= 1 to avoid querying PID 0 or PID 1.
+    """
+    if pgid is None or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _get_descendant_pids(root_pid: int) -> List[int]:
+    """
+    Recursively discovers all descendant PIDs of root_pid without external dependencies.
+    Inspects Linux /proc/<pid>/task/*/children with a fallback to pgrep -P.
+    Returns descendants in BFS order (to be signaled bottom-up via reversed()).
+    """
+    if not root_pid or root_pid <= 1:
+        return []
+    descendants = []
+    to_visit = [root_pid]
+    visited = {root_pid}
+    while to_visit:
+        curr = to_visit.pop(0)
+        children = []
+        # 1. Direct Linux kernel interface: /proc/<curr>/task/*/children
+        task_dir = Path(f"/proc/{curr}/task")
+        if task_dir.is_dir():
+            try:
+                for tid_dir in task_dir.iterdir():
+                    child_file = tid_dir / "children"
+                    if child_file.is_file():
+                        try:
+                            content = child_file.read_text().strip()
+                            if content:
+                                children.extend([int(c) for c in content.split() if c.isdigit()])
+                        except (OSError, ValueError):
+                            pass
+            except (OSError, PermissionError):
+                pass
+        # 2. Standard POSIX fallback: pgrep -P <curr>
+        if not children:
+            try:
+                out = subprocess.check_output(
+                    ["pgrep", "-P", str(curr)],
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.2
+                )
+                children.extend([int(p) for p in out.decode().split() if p.isdigit()])
+            except Exception:
+                pass
+        for c in children:
+            if c not in visited and c > 1:
+                visited.add(c)
+                descendants.append(c)
+                to_visit.append(c)
+    return descendants
+
+
+def kill_process_tree(proc: subprocess.Popen, timeout_sigint: float = 1.0, timeout_sigterm: float = 0.8):
+    """
+    Deterministically eradicates the child process tree using 3-stage escalation:
+    SIGINT -> wait -> SIGTERM -> wait -> SIGKILL.
+    Guarantees that signals are NEVER broadcast to supervisor's own process group (pgid == os.getpgrp()).
+    Tracks all descendant PIDs even if root exits early.
+    """
+    if not proc or not hasattr(proc, "pid") or proc.pid is None or proc.pid <= 1:
+        return
+
+    supervisor_pid = os.getpid()
+    supervisor_pgid = os.getpgrp()
+
+    try:
+        pgid = os.getpgid(proc.pid)
+        # Safe to use os.killpg ONLY if child has a distinct, valid PGID != supervisor's PGID
+        has_own_pgid = (pgid is not None and pgid != supervisor_pgid and pgid > 1)
+    except (OSError, AttributeError):
+        has_own_pgid = False
+        pgid = None
+
+    known_descendants: Set[int] = set()
+    descendant_order: List[int] = []
+
+    def refresh_descendants():
+        # Scan root process if alive
+        if hasattr(proc, "pid") and proc.pid and proc.pid > 1:
+            try:
+                if _is_pid_alive(proc.pid):
+                    for d in _get_descendant_pids(proc.pid):
+                        if d not in known_descendants and d != supervisor_pid and d > 1:
+                            known_descendants.add(d)
+                            descendant_order.append(d)
+            except Exception:
+                pass
+        # Scan surviving known descendants for newly spawned children
+        for d in list(known_descendants):
+            try:
+                if _is_pid_alive(d):
+                    for child in _get_descendant_pids(d):
+                        if child not in known_descendants and child != supervisor_pid and child > 1:
+                            known_descendants.add(child)
+                            descendant_order.append(child)
+            except Exception:
+                pass
+
+    def is_tree_dead() -> bool:
+        if proc.poll() is None:
+            return False
+        if has_own_pgid and pgid and _is_pgid_alive(pgid):
+            return False
+        if any(_is_pid_alive(d) for d in known_descendants):
+            return False
+        return True
+
+    # Initial scan of descendant tree before sending any signals
+    refresh_descendants()
+
+    if is_tree_dead():
+        return
+
+    def send(sig: int):
+        refresh_descendants()
+        if has_own_pgid and pgid:
+            try:
+                os.killpg(pgid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+        # Signal discovered descendants bottom-up (reversed BFS order)
+        for d in reversed(descendant_order):
+            if d != supervisor_pid and d > 1:
+                try:
+                    os.kill(d, sig)
+                except OSError:
+                    pass
+        if proc.poll() is None:
+            try:
+                proc.send_signal(sig)
+            except (OSError, AttributeError):
+                pass
+
+    # Stage 1: SIGINT
+    send(signal.SIGINT)
+    start = time.time()
+    while time.time() - start < timeout_sigint:
+        if is_tree_dead():
+            return
+        time.sleep(0.05)
+        refresh_descendants()
+
+    # Stage 2: SIGTERM
+    send(signal.SIGTERM)
+    start = time.time()
+    while time.time() - start < timeout_sigterm:
+        if is_tree_dead():
+            return
+        time.sleep(0.05)
+        refresh_descendants()
+
+    # Stage 3: SIGKILL
+    send(signal.SIGKILL)
+    start = time.time()
+    while time.time() - start < 0.5:
+        if is_tree_dead():
+            return
+        time.sleep(0.05)
+    try:
+        proc.wait(timeout=0.1)
+    except Exception:
+        pass
 
 class TerminalGuard:
     """RAII context manager to guarantee clean terminal state on any exit or exception."""
@@ -253,11 +2037,21 @@ class TerminalGuard:
             sys.stdout.flush()
 
 class AccountManager:
-    def __init__(self):
+    def __init__(self, circuit_breaker: Optional[ThrashingCircuitBreaker] = None):
         self.state_file = STATE_FILE
         self.accounts_dir = ACCOUNTS_DIR
         self.ensure_dirs()
         self.state = self.load_state()
+        self.consecutive_failovers = 0
+        self.rotation_timestamps = deque(maxlen=20)
+        self.circuit_breaker = circuit_breaker or ThrashingCircuitBreaker()
+        self.active_slot_applied: Optional[str] = None
+        cb_state = self.state.get("circuit_breaker")
+        if cb_state is not None:
+            try:
+                self.circuit_breaker.load_dict(cb_state)
+            except Exception:
+                self.circuit_breaker.reset()
 
     def ensure_dirs(self):
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
@@ -280,17 +2074,24 @@ class AccountManager:
             try:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
-                    if "slots" not in data:
+                    if not isinstance(data, dict):
+                        data = {}
+                    if not isinstance(data.get("slots"), dict):
                         data["slots"] = {}
+                    if not isinstance(data.get("conversation_slots"), dict):
+                        data["conversation_slots"] = {}
                     return data
             except Exception:
                 pass
         return {
             "current_slot": 1,
-            "slots": {}
+            "slots": {},
+            "conversation_slots": {}
         }
 
     def save_state(self):
+        if hasattr(self, "circuit_breaker") and self.circuit_breaker:
+            self.state["circuit_breaker"] = self.circuit_breaker.to_dict()
         tmp_file = self.state_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:
@@ -306,12 +2107,81 @@ class AccountManager:
             with open(self.state_file, "w") as f:
                 json.dump(self.state, f, indent=2)
 
+    def get_conversation_owner(self, conv_id: str) -> Optional[int]:
+        """Returns the numeric slot ID that owns the conversation, or None."""
+        if not conv_id:
+            return None
+        raw = self.state.get("conversation_slots", {}).get(conv_id)
+        if raw is not None:
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    def set_conversation_owner(self, conv_id: str, slot: int):
+        """Registers slot ownership for a conversation ID in supervisor state."""
+        if not conv_id:
+            return
+        if "conversation_slots" not in self.state:
+            self.state["conversation_slots"] = {}
+        self.state["conversation_slots"][conv_id] = int(slot)
+        self.state["last_active_conversation"] = conv_id
+        self.state["last_active_slot"] = int(slot)
+        self.save_state()
+
+    def reset_failovers(self):
+        """Resets the consecutive failover counter upon a stable turn or successful session."""
+        self.consecutive_failovers = 0
+
+    def calculate_handover_delay(self) -> float:
+        """
+        Calculates randomized handover delay with progressive backoff:
+        t_base in [2.5s, 5.0s]. On consecutive failovers, scales by 1.5^k, capped at 30.0s.
+        """
+        return calculate_handover_jitter(self.consecutive_failovers)
+
     def get_current_slot(self) -> str:
         return str(self.state.get("current_slot", 1))
 
     def sync_back_current(self):
+        """
+        Safely synchronizes updated tokens from ~/.gemini/ and Keyring back into the active slot.
+        Enforces 4 independent defensive guards against cross-slot credential contamination:
+        1. Quarantine Status Guard: Aborts if slot is quarantined (CLIENT_ID_MISMATCH, NOTICE_BLOCKED, etc.)
+        2. Audience Safety Guard: Aborts if slot directory contains unsafe foreign tokens
+        3. Identity Cross-Check Guard: Aborts if emails between ~/.gemini/ and slot_dir mismatch
+        4. Active Slot Guard: Aborts if slot was not successfully activated in the current session
+        """
         slot = self.get_current_slot()
         slot_dir = self.accounts_dir / slot
+
+        # Guard 1: Slot state quarantine check
+        s_info = (self.state.get("slots") or {}).get(str(slot))
+        if not isinstance(s_info, dict):
+            s_info = {}
+        s_status = s_info.get("status", "ACTIVE")
+        if s_status in ("CLIENT_ID_MISMATCH", "NOTICE_BLOCKED", "SUSPENDED", "AUTH_FAILURE", "AUTH_FAILED"):
+            return
+
+        # Guard 2: Slot audience safety verification
+        if slot_dir.exists():
+            rep = AudienceValidator.validate_slot(slot_dir, strict=False)
+            if not rep.is_safe_to_activate:
+                return
+
+        # Guard 3: Cross-slot email matching check
+        email_slot = extract_email_from_path(slot_dir)
+        email_gemini = extract_email_from_path(GEMINI_DIR)
+        if email_slot and email_slot != "Unknown" and email_gemini and email_gemini != "Unknown":
+            if email_slot.lower().strip() != email_gemini.lower().strip():
+                return
+
+        # Guard 4: Active slot tracking
+        if hasattr(self, "active_slot_applied") and self.active_slot_applied is not None:
+            if str(self.active_slot_applied) != str(slot):
+                return
+
         slot_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(slot_dir, 0o700)
@@ -335,12 +2205,8 @@ class AccountManager:
                 except Exception:
                     continue
 
-                with open(src, "rb") as f_in, open(dst, "wb") as f_out:
-                    f_out.write(f_in.read())
-                try:
-                    os.chmod(dst, 0o600)
-                except OSError:
-                    pass
+                atomic_copy_file(src, dst)
+
         # Sync keyring secret
         sec = get_keyring_secret()
         if sec:
@@ -357,6 +2223,47 @@ class AccountManager:
             except Exception:
                 pass
 
+    def sync_probe_result(self, res: SlotProbeResult):
+        """Updates supervisor_state.json with ground-truth findings from SlotHealthProber."""
+        now = int(time.time())
+        slot_str = str(res.slot)
+        if "slots" not in self.state or not isinstance(self.state.get("slots"), dict):
+            self.state["slots"] = {}
+        s_dict = self.state["slots"].get(slot_str)
+        if not isinstance(s_dict, dict):
+            self.state["slots"][slot_str] = {}
+            s_dict = self.state["slots"][slot_str]
+        if res.status == SlotStatusType.HEALTHY:
+            s_dict["status"] = "ACTIVE"
+            s_dict["exhausted_until"] = 0
+            s_dict.pop("reason", None)
+            s_dict.pop("suspension_reason", None)
+        elif res.status == SlotStatusType.QUOTA_EXHAUSTED:
+            s_dict["status"] = "EXHAUSTED_DAILY"
+            reset_ts = res.reset_timestamp
+            if not reset_ts or reset_ts <= now:
+                reset_ts = now + (res.reset_seconds if res.reset_seconds > 0 else 3600)
+            s_dict["exhausted_until"] = reset_ts
+            s_dict["reason"] = res.details or "Individual quota reached"
+            s_dict["blocked_at"] = now
+        elif res.status == SlotStatusType.NOTICE_SUSPENDED:
+            s_dict["status"] = "NOTICE_BLOCKED"
+            s_dict["exhausted_until"] = now + 10 * 365 * 86400
+            s_dict["reason"] = res.notice_reason or "Google Terms of Service violation"
+            s_dict["suspension_reason"] = s_dict["reason"]
+            s_dict["blocked_at"] = now
+        elif res.status == SlotStatusType.CLIENT_ID_MISMATCH:
+            s_dict["status"] = "CLIENT_ID_MISMATCH"
+            s_dict["exhausted_until"] = now + 10 * 365 * 86400
+            s_dict["reason"] = res.details or "Client ID mismatch (gemini-cli token)"
+            s_dict["blocked_at"] = now
+        elif res.status == SlotStatusType.TOKEN_REVOKED:
+            s_dict["status"] = "AUTH_FAILED"
+            s_dict["exhausted_until"] = now + 10 * 365 * 86400
+            s_dict["reason"] = res.details or "Token revoked"
+            s_dict["blocked_at"] = now
+        self.save_state()
+
     def apply_slot(self, slot: str) -> bool:
         slot_dir = self.accounts_dir / str(slot)
         oauth_src = slot_dir / "oauth_creds.json"
@@ -365,16 +2272,28 @@ class AccountManager:
         if not oauth_src.exists() and not keyring_src.exists():
             return False
 
+        # Feature F8: Token Audience & Client ID Guard
+        report = AudienceValidator.validate_slot(slot_dir, strict=False)
+        if not report.is_safe_to_activate:
+            sys.stdout.write(format_diagnostic_box(str(slot), report))
+            sys.stdout.flush()
+            now = int(time.time())
+            if "slots" not in self.state or not isinstance(self.state.get("slots"), dict):
+                self.state["slots"] = {}
+            self.state["slots"][str(slot)] = {
+                "status": "CLIENT_ID_MISMATCH",
+                "exhausted_until": now + 10 * 365 * 86400,
+                "reason": report.diagnostic_message,
+                "blocked_at": now
+            }
+            self.save_state()
+            return False
+
         for fname in ["oauth_creds.json", "google_accounts.json"]:
             src = slot_dir / fname
             dst = GEMINI_DIR / fname
             if src.exists():
-                with open(src, "rb") as f_in, open(dst, "wb") as f_out:
-                    f_out.write(f_in.read())
-                try:
-                    os.chmod(dst, 0o600)
-                except OSError:
-                    pass
+                atomic_copy_file(src, dst)
 
         # Update Secret Service keyring
         if keyring_src.exists():
@@ -386,6 +2305,24 @@ class AccountManager:
             except Exception:
                 pass
 
+        # Milestone 2: Per-slot installation_id isolation to defeat Sybil clustering
+        slot_inst = slot_dir / "installation_id"
+        target_inst = CLI_DIR / "installation_id"
+        if not slot_inst.exists():
+            try:
+                slot_inst.write_text(str(uuid.uuid4()))
+                os.chmod(slot_inst, 0o600)
+            except OSError:
+                pass
+        if slot_inst.exists():
+            try:
+                CLI_DIR.mkdir(parents=True, exist_ok=True)
+                target_inst.write_text(slot_inst.read_text().strip())
+                os.chmod(target_inst, 0o600)
+            except OSError:
+                pass
+
+        self.active_slot_applied = str(slot)
         self.state["current_slot"] = int(slot)
         self.save_state()
         return True
@@ -400,23 +2337,88 @@ class AccountManager:
         midnight = datetime.datetime.combine(tomorrow_date, datetime.time(0, 5, 0), tzinfo=tz)
         return int(midnight.timestamp())
 
+    def mark_slot_failed(self, slot: str, event: LogEventClassification):
+        """
+        Marks slot status based on classified event:
+        - ACCOUNT_NOTICE: marked as 'NOTICE_BLOCKED' with indefinite (10-year) lockout.
+        - AUTH_FAILURE: marked as 'AUTH_FAILED' with indefinite (10-year) lockout.
+        - QUOTA_EXHAUSTED: marked as EXHAUSTED_DAILY or COOLDOWN_RPM.
+        """
+        now = int(time.time())
+        slot_str = str(slot)
+        if "slots" not in self.state or not isinstance(self.state.get("slots"), dict):
+            self.state["slots"] = {}
+
+        if event.event_type in (LogEventType.ACCOUNT_NOTICE, "EVENT_ACCOUNT_NOTICE", "ACCOUNT_NOTICE"):
+            reason = event.reason or "Google Terms of Service / Account Notice"
+            self.state["slots"][slot_str] = {
+                "status": "NOTICE_BLOCKED",
+                "exhausted_until": now + 10 * 365 * 86400,
+                "reason": reason,
+                "suspension_reason": reason,
+                "blocked_at": now
+            }
+            self.save_state()
+        elif event.event_type in (LogEventType.AUTH_FAILURE, "EVENT_AUTH_FAILURE", "AUTH_FAILURE"):
+            reason = event.reason or "Authentication failure (401/403)"
+            self.state["slots"][slot_str] = {
+                "status": "AUTH_FAILED",
+                "exhausted_until": now + 10 * 365 * 86400,
+                "reason": reason,
+                "suspension_reason": reason,
+                "blocked_at": now
+            }
+            self.save_state()
+        elif event.is_quota or event.event_type in (LogEventType.QUOTA_EXHAUSTED, "EVENT_QUOTA_EXHAUSTED", "QUOTA_EXHAUSTED"):
+            is_daily = event.is_daily
+            reset_secs = event.reset_seconds
+
+            # Defense-in-depth: if raw log indicates terminal quota exhaustion, force is_daily=True
+            raw_check = (event.raw_line or b"") + b" " + (event.raw_match or "").encode("utf-8") + b" " + (event.message or "").encode("utf-8")
+            lower = raw_check.lower()
+            if any(p in lower for p in TRUE_TERMINAL_QUOTA_PATTERNS):
+                is_daily = True
+
+            self.mark_exhausted(slot, reset_secs=reset_secs, is_daily=is_daily)
+
+    def mark_slot_suspended(self, slot: str, reason: str = ""):
+        event = LogEventClassification(
+            event_type=LogEventType.ACCOUNT_NOTICE,
+            reason=reason or "Account suspended",
+            raw_match=reason
+        )
+        self.mark_slot_failed(slot, event)
+
     def mark_exhausted(self, slot: str, reset_secs: int = 0, is_daily: bool = True):
         now = int(time.time())
         if reset_secs > 0:
             until = now + reset_secs
+            if reset_secs < 600:
+                is_daily = False
+            else:
+                is_daily = True
         else:
             until = self.calculate_midnight_pacific() if is_daily else now + 60
-        if "slots" not in self.state:
+        if "slots" not in self.state or not isinstance(self.state.get("slots"), dict):
             self.state["slots"] = {}
-        self.state["slots"][str(slot)] = {
+        slot_str = str(slot)
+        self.state["slots"][slot_str] = {
             "status": "EXHAUSTED_DAILY" if is_daily else "COOLDOWN_RPM",
-            "exhausted_until": until
+            "exhausted_until": until,
+            "reason": "Individual quota reached" if is_daily else "Rate limit cooldown",
+            "blocked_at": now
         }
         self.save_state()
 
     def rotate_to_next(self) -> str:
         self.sync_back_current()
-        now = int(time.time())
+        now = time.time()
+
+        # Prune old rotation entries (> 60s)
+        while self.rotation_timestamps and self.rotation_timestamps[0] < now - 60.0:
+            self.rotation_timestamps.popleft()
+        self.rotation_timestamps.append(now)
+
         try:
             curr = int(self.get_current_slot())
         except (ValueError, TypeError):
@@ -435,40 +2437,97 @@ class AccountManager:
             sys.stdout.flush()
             return ""
 
-        # Filter out slots still in cooldown or daily exhaustion
-        available = [
-            s for s in all_slots
-            if now >= self.state.get("slots", {}).get(str(s), {}).get("exhausted_until", 0)
-        ]
+        # Check Rotational Storm: >= 4 rotations in 60s (scaled for >= 4 slots)
+        storm_limit = max(4, len(all_slots) + 1 if len(all_slots) >= 4 else 4)
+        if len(self.rotation_timestamps) >= storm_limit:
+            min_wait = 60
+            slots_map = self.state.get("slots")
+            if isinstance(slots_map, dict):
+                waits = []
+                for i in all_slots:
+                    entry = slots_map.get(str(i))
+                    if not isinstance(entry, dict):
+                        entry = {}
+                    waits.append(entry.get("exhausted_until", int(now) + 120))
+                if waits:
+                    min_wait = min(waits)
+            wait_seconds = max(30, int(min_wait - now))
+            sys.stdout.write("\r\n\033[1;31m" + "=" * 75 + "\033[0m\r\n")
+            sys.stdout.write("\033[1;31m[!] ROTATIONAL CIRCUIT BREAKER TRIPPED!\033[0m\r\n")
+            sys.stdout.write(f"\033[1;33m[*] Phát hiện {len(self.rotation_timestamps)} lần chuyển slot liên tiếp trong <60s.\033[0m\r\n")
+            sys.stdout.write(f"\033[1;33m[*] Tự động kích hoạt cơ chế phòng vệ chống bão lỗi 4xx (Doorman Anti-Thrashing).\033[0m\r\n")
+            sys.stdout.write(f"\033[1;33m[*] Toàn bộ các slot tạm ngưng xoay tua trong {wait_seconds}s để bảo vệ tài khoản khỏi án phạt 57h.\033[0m\r\n")
+            sys.stdout.write("\033[1;31m" + "=" * 75 + "\033[0m\r\n\r\n")
+            sys.stdout.flush()
+            return ""
+
+        # Filter out slots still in cooldown, daily exhaustion, or notice/auth/mismatch blocked
+        available = []
+        for s in all_slots:
+            s_info = (self.state.get("slots") or {}).get(str(s))
+            if not isinstance(s_info, dict):
+                s_info = {}
+            status = s_info.get("status", "ACTIVE")
+            if status in ("NOTICE_BLOCKED", "SUSPENDED", "AUTH_FAILURE", "AUTH_FAILED", "CLIENT_ID_MISMATCH"):
+                continue  # Never automatically consider suspended/notice slots as available!
+            report = AudienceValidator.validate_slot(self.accounts_dir / str(s), strict=False)
+            if not report.is_safe_to_activate:
+                if "slots" not in self.state or not isinstance(self.state.get("slots"), dict):
+                    self.state["slots"] = {}
+                self.state["slots"][str(s)] = {
+                    "status": "CLIENT_ID_MISMATCH",
+                    "exhausted_until": int(now) + 10 * 365 * 86400,
+                    "reason": report.diagnostic_message,
+                    "blocked_at": int(now)
+                }
+                self.save_state()
+                continue
+            if int(now) >= s_info.get("exhausted_until", 0):
+                available.append(s)
 
         # Refresh state for recovered slots
         state_modified = False
-        for s in available:
-            slot_key = str(s)
-            if slot_key in self.state.get("slots", {}):
-                if self.state["slots"][slot_key].get("status") != "ACTIVE":
-                    self.state["slots"][slot_key]["status"] = "ACTIVE"
-                    state_modified = True
+        slots_map = self.state.get("slots")
+        if isinstance(slots_map, dict):
+            for s in available:
+                slot_key = str(s)
+                if slot_key in slots_map:
+                    slot_entry = slots_map[slot_key]
+                    if isinstance(slot_entry, dict) and slot_entry.get("status") in ("EXHAUSTED_DAILY", "COOLDOWN_RPM"):
+                        slot_entry["status"] = "ACTIVE"
+                        slot_entry["exhausted_until"] = 0
+                        state_modified = True
         if state_modified:
             self.save_state()
 
         if not available:
-            # Circuit breaker: ALL configured accounts are exhausted
-            min_wait = min(self.state.get("slots", {}).get(str(i), {}).get("exhausted_until", now + 3600) for i in all_slots)
-            wait_seconds = max(10, min_wait - now)
-            hours = wait_seconds // 3600
-            mins = (wait_seconds % 3600) // 60
+            # Circuit breaker: ALL configured accounts are exhausted or blocked
             sys.stdout.write("\r\n\033[1;31m" + "=" * 70 + "\033[0m\r\n")
-            sys.stdout.write(f"\033[1;31m[!] CIRCUIT BREAKER: Toàn bộ {len(all_slots)} tài khoản khả dụng đều đã cạn quota!\033[0m\r\n")
-            sys.stdout.write(f"\033[1;33m[*] Cooldown ngắn nhất còn lại: khoảng {hours} giờ {mins} phút nữa.\033[0m\r\n")
+            sys.stdout.write(f"\033[1;31m[!] CIRCUIT BREAKER: Toàn bộ {len(all_slots)} tài khoản khả dụng đều không thể sử dụng!\033[0m\r\n")
             for i in all_slots:
                 s_str = str(i)
                 em = extract_email_from_path(self.accounts_dir / s_str)
-                u = self.state.get("slots", {}).get(s_str, {}).get("exhausted_until", 0)
-                rem = max(0, u - now)
-                sys.stdout.write(f"    - Slot {s_str} ({em}): chờ {rem // 3600}h {(rem % 3600) // 60}m\r\n")
-            sys.stdout.write("\033[1;36m💡 Muốn nạp thêm tài khoản mới: agy-supervisor add\033[0m\r\n")
-            sys.stdout.write("\033[1;36m💡 Nếu tài khoản đã có lại quota và muốn reset cooldown: agy-supervisor reset\033[0m\r\n")
+                s_info = (self.state.get("slots") or {}).get(s_str)
+                if not isinstance(s_info, dict):
+                    s_info = {}
+                st = s_info.get("status", "ACTIVE")
+                u = s_info.get("exhausted_until", 0)
+                rem = max(0, u - int(now))
+                if st in ("NOTICE_BLOCKED", "SUSPENDED"):
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): \033[1;31mNOTICE_BLOCKED\033[0m - {s_info.get('suspension_reason') or s_info.get('reason', 'ToS Notice')}\r\n")
+                elif st in ("AUTH_FAILURE", "AUTH_FAILED"):
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): \033[1;31mAUTH_FAILED\033[0m - {s_info.get('suspension_reason') or s_info.get('reason', 'Auth error')}\r\n")
+                elif st == "CLIENT_ID_MISMATCH":
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): \033[1;35mCLIENT_ID_MISMATCH\033[0m - {s_info.get('reason', 'Client ID mismatch')}\r\n")
+                elif st == "EXHAUSTED_DAILY":
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): EXHAUSTED_DAILY (chờ {rem // 3600}h {(rem % 3600) // 60}m)\r\n")
+                elif st == "COOLDOWN_RPM":
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): COOLDOWN_RPM (chờ {rem}s)\r\n")
+                else:
+                    sys.stdout.write(f"    - Slot {s_str} ({em}): {st}\r\n")
+            sys.stdout.write("\033[1;36m💡 Thêm tài khoản mới: agy-supervisor add\033[0m\r\n")
+            sys.stdout.write("\033[1;36m💡 Đăng nhập lại tài khoản bị khóa: agy-supervisor login <slot>\033[0m\r\n")
+            sys.stdout.write("\033[1;36m💡 Reset cooldown: agy-supervisor reset\033[0m\r\n")
             sys.stdout.write("\033[1;31m" + "=" * 70 + "\033[0m\r\n\r\n")
             sys.stdout.flush()
             return ""
@@ -484,7 +2543,13 @@ class AccountManager:
         if not next_slot:
             next_slot = str(available[0])
 
-        time.sleep(2.0)
+        # Milestone 2: Adaptive Handover Jitter with progressive backoff
+        delay = self.calculate_handover_delay()
+        sys.stdout.write(f"\r\n\033[1;36m[*] Handover Jitter: Tạm dừng {delay:.2f}s (failover #{self.consecutive_failovers + 1}) để phân tán mẫu truy vấn và tránh bẫy Sybil (abuse.pi)...\033[0m\r\n")
+        sys.stdout.flush()
+        time.sleep(delay)
+        self.consecutive_failovers += 1
+
         self.apply_slot(next_slot)
         return next_slot
 
@@ -494,9 +2559,15 @@ class ProcessSupervisor:
     Guarantees 100% native TUI responsiveness (no PTY buffering/echo/hang issues)
     while reliably intercepting quota events in real time.
     """
-    def __init__(self, account_mgr: AccountManager):
+    def __init__(self, account_mgr: AccountManager, circuit_breaker: Optional[ThrashingCircuitBreaker] = None):
         self.account_mgr = account_mgr
+        self.circuit_breaker = (
+            circuit_breaker 
+            or getattr(account_mgr, "circuit_breaker", None) 
+            or ThrashingCircuitBreaker()
+        )
         self.child_process = None
+        self.last_event = None
 
     def wait_for_presence_lock_release(self, timeout=3.0) -> bool:
         start = time.time()
@@ -520,17 +2591,238 @@ class ProcessSupervisor:
             time.sleep(0.1)
         return False
 
-    def run_session(self, user_args, is_continue=False) -> tuple:
+    def get_latest_conversation(self) -> Optional[str]:
+        """
+        Retrieves the conversation_id of the most recent conversation from conversation_summaries.db.
+        Returns None if no conversation exists.
+        """
+        db_path = CLI_DIR / "conversation_summaries.db"
+        if not db_path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+            c = conn.cursor()
+            c.execute("SELECT conversation_id FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 1;")
+            row = c.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def fork_conversation(self, parent_conv_id: str, target_slot: int) -> Optional[str]:
+        """
+        Forks an existing conversation into a new conversation owned by target_slot.
+        Creates a new SQLite conversation file with fresh trajectory_id and cascade_id,
+        and adds a corresponding summary entry in conversation_summaries.db.
+
+        Guarantees WAL synchronization, atomic file promotion via .tmp and os.replace,
+        and clean cleanup on any Exception or BaseException (including KeyboardInterrupt).
+        """
+        conv_dir = CLI_DIR / "conversations"
+        src_db = conv_dir / f"{parent_conv_id}.db"
+        if not src_db.exists():
+            return None
+
+        new_conv_id = str(uuid.uuid4())
+        new_traj_id = str(uuid.uuid4())
+        dst_tmp = conv_dir / f"{new_conv_id}.db.tmp"
+        dst_db = conv_dir / f"{new_conv_id}.db"
+        summaries_db = CLI_DIR / "conversation_summaries.db"
+
+        try:
+            # 1. Best-effort checkpoint on source to flush pending WAL pages
+            try:
+                chk_conn = sqlite3.connect(str(src_db), timeout=2.0)
+                chk_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                chk_conn.close()
+            except Exception:
+                pass
+
+            # 2. Online SQLite Backup to dst_tmp (safely copies active WAL pages without corruption)
+            src_conn = sqlite3.connect(f"file:{src_db.resolve()}?mode=ro", uri=True, timeout=5.0)
+            dst_conn = sqlite3.connect(str(dst_tmp), timeout=5.0)
+            with dst_conn:
+                src_conn.backup(dst_conn)
+            dst_conn.close()
+            src_conn.close()
+
+            try:
+                os.chmod(dst_tmp, 0o600)
+            except OSError:
+                pass
+
+            # 3. Update trajectory_meta with new UUIDs if table exists
+            conn_conv = sqlite3.connect(str(dst_tmp), timeout=5.0)
+            c_conv = conn_conv.cursor()
+            c_conv.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trajectory_meta';")
+            if c_conv.fetchone():
+                c_conv.execute("UPDATE trajectory_meta SET trajectory_id = ?, cascade_id = ?;", (new_traj_id, new_conv_id))
+                conn_conv.commit()
+            try:
+                conn_conv.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+            conn_conv.close()
+
+            # 4. Atomic file replacement: promote .tmp to final destination DB
+            os.replace(dst_tmp, dst_db)
+
+            # 5. Insert or update entry in conversation_summaries.db
+            if summaries_db.exists():
+                conn_sum = sqlite3.connect(str(summaries_db), timeout=5.0)
+                conn_sum.row_factory = sqlite3.Row
+                c_sum = conn_sum.cursor()
+                c_sum.execute("SELECT * FROM conversation_summaries WHERE conversation_id = ?;", (parent_conv_id,))
+                parent_row = c_sum.fetchone()
+
+                row_dict = dict(parent_row) if parent_row else {}
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S.%f") + "+00:00"
+
+                cols = [
+                    "conversation_id", "title", "preview", "step_count", "last_modified_time",
+                    "workspace_uris", "status", "source", "project_id", "agent_name",
+                    "parent_conversation_id", "nesting_depth", "battle_id", "winning_conversation_id",
+                    "not_fully_idle", "killed", "last_user_input_time", "last_user_input_step_index",
+                    "app_data_dir", "raw_summary", "group_id"
+                ]
+                c_sum.execute("PRAGMA table_info(conversation_summaries);")
+                existing_cols = {col[1] for col in c_sum.fetchall()}
+                insert_cols = [c for c in cols if c in existing_cols] if existing_cols else cols
+
+                val_map = {
+                    "conversation_id": new_conv_id,
+                    "title": row_dict.get("title", ""),
+                    "preview": row_dict.get("preview", ""),
+                    "step_count": row_dict.get("step_count", 0),
+                    "last_modified_time": now_str,
+                    "workspace_uris": row_dict.get("workspace_uris", "[]"),
+                    "status": row_dict.get("status", "CASCADE_RUN_STATUS_IDLE"),
+                    "source": row_dict.get("source", ""),
+                    "project_id": row_dict.get("project_id", "default-cli-project"),
+                    "agent_name": row_dict.get("agent_name", ""),
+                    "parent_conversation_id": parent_conv_id,
+                    "nesting_depth": int(row_dict.get("nesting_depth", 0) or 0) + 1,
+                    "battle_id": row_dict.get("battle_id", ""),
+                    "winning_conversation_id": row_dict.get("winning_conversation_id", ""),
+                    "not_fully_idle": row_dict.get("not_fully_idle", 0),
+                    "killed": row_dict.get("killed", 0),
+                    "last_user_input_time": now_str,
+                    "last_user_input_step_index": row_dict.get("last_user_input_step_index", -1),
+                    "app_data_dir": row_dict.get("app_data_dir", "antigravity-cli"),
+                    "raw_summary": row_dict.get("raw_summary"),
+                    "group_id": row_dict.get("group_id", "")
+                }
+                vals = [val_map.get(col, row_dict.get(col)) for col in insert_cols]
+                placeholders = ", ".join(["?"] * len(insert_cols))
+                col_str = ", ".join(insert_cols)
+                c_sum.execute(f"INSERT OR REPLACE INTO conversation_summaries ({col_str}) VALUES ({placeholders});", vals)
+                conn_sum.commit()
+                conn_sum.close()
+
+            # 6. Register ownership in supervisor state
+            self.account_mgr.set_conversation_owner(new_conv_id, target_slot)
+            return new_conv_id
+
+        except BaseException as e:
+            # Atomic rollback: clean up partial files and database entries
+            for p in (dst_tmp, dst_db):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                for suffix in ("-wal", "-shm"):
+                    extra = p.parent / f"{p.name}{suffix}"
+                    if extra.exists():
+                        try:
+                            extra.unlink()
+                        except OSError:
+                            pass
+
+            if summaries_db.exists():
+                try:
+                    conn_sum_clean = sqlite3.connect(str(summaries_db), timeout=2.0)
+                    conn_sum_clean.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?;", (new_conv_id,))
+                    conn_sum_clean.commit()
+                    conn_sum_clean.close()
+                except Exception:
+                    pass
+
+            if isinstance(e, Exception):
+                sys.stderr.write(f"\r\n\033[1;33m[!] Cảnh báo fork conversation: {e}\033[0m\r\n")
+                return None
+            raise
+
+    def prepare_session(self, target_slot: int, is_continue: bool = False) -> List[str]:
+        """
+        Implements Milestone 2 Cross-Account Session Isolation Contract.
+        When continuing a session:
+        - Checks whether the most recent conversation was owned by a different account slot.
+        - If crossing account boundaries, forks the conversation SQLite DB with fresh UUIDs
+          so Google cannot link different accounts to the same trajectory_id.
+        Returns the command arguments to inject.
+        """
+        if not is_continue:
+            return ["--dangerously-skip-permissions"]
+
+        target_slot_int = int(target_slot)
+        try:
+            curr_slot_int = int(self.account_mgr.get_current_slot())
+        except (ValueError, TypeError):
+            curr_slot_int = 1
+
+        latest_conv = self.get_latest_conversation()
+        if not latest_conv:
+            if target_slot_int == curr_slot_int:
+                return ["-c", "--dangerously-skip-permissions"]
+            return ["--dangerously-skip-permissions"]
+
+        owner_slot = self.account_mgr.get_conversation_owner(latest_conv)
+        last_active = self.account_mgr.state.get("last_active_slot")
+
+        is_cross_account = False
+        if owner_slot is not None and owner_slot != target_slot_int:
+            is_cross_account = True
+        elif owner_slot is None and last_active is not None and int(last_active) != target_slot_int:
+            is_cross_account = True
+        elif target_slot_int != curr_slot_int:
+            is_cross_account = True
+
+        # If staying on the same account slot, resume directly
+        if not is_cross_account:
+            return ["-c", "--dangerously-skip-permissions"]
+
+        # Account boundary crossing detected: fork conversation to namespace trajectory
+        slot_display = str(owner_slot) if owner_slot is not None else str(last_active or curr_slot_int)
+        sys.stdout.write(f"\r\n\033[1;35m[Session Isolation] Phát hiện chuyển đổi tài khoản (Slot {slot_display} -> Slot {target_slot_int}).\033[0m\r\n")
+        sys.stdout.write("\033[1;35m    Đang fork phiên chat sang Trajectory UUID mới để ngăn chặn Sybil Correlation (abuse.pi)...\033[0m\r\n")
+        sys.stdout.flush()
+
+        forked_id = self.fork_conversation(latest_conv, target_slot_int)
+        if forked_id:
+            sys.stdout.write(f"\033[1;32m[OK] Phiên chat đã được cô lập thành công (Conversation ID: {forked_id[:8]}...).\033[0m\r\n")
+            sys.stdout.flush()
+            return ["--conversation", forked_id, "--dangerously-skip-permissions"]
+
+        # Fallback: if fork fails, use clean session without -c to avoid credential tainting
+        sys.stdout.write("\033[1;33m[!] Không thể fork phiên cũ an toàn; khởi chạy phiên mới độc lập.\033[0m\r\n")
+        sys.stdout.flush()
+        return ["--dangerously-skip-permissions"]
+
+    def run_session(self, user_args, is_continue=False) -> SessionResult:
         """
         Runs agy in direct foreground execution.
-        Returns: (quota_detected: bool, reset_seconds: int)
+        Returns SessionResult: (quota_detected: bool, reset_seconds: int, is_daily: bool) with event.
         """
         self.wait_for_presence_lock_release()
 
+        # Milestone 2: Cross-Account Session Isolation
+        curr_slot = int(self.account_mgr.get_current_slot())
+        session_args = self.prepare_session(target_slot=curr_slot, is_continue=is_continue)
+
         cmd = ["agy"]
-        if is_continue:
-            cmd.append("-c")
-        cmd.append("--dangerously-skip-permissions")
+        cmd.extend(session_args)
 
         # If continuing session, avoid duplicating one-time prompts while preserving runtime flags
         if is_continue:
@@ -541,6 +2833,10 @@ class ProcessSupervisor:
                     skip_next = False
                     continue
                 if arg in ["-c", "--continue", "--dangerously-skip-permissions"]:
+                    continue
+                if "--conversation" in session_args and arg == "--conversation":
+                    if i + 1 < len(user_args) and not user_args[i + 1].startswith("-"):
+                        skip_next = True
                     continue
                 # Skip one-time prompt invocations in continue mode
                 if arg in ["-p", "--print", "--prompt", "-i", "--prompt-interactive"]:
@@ -565,39 +2861,61 @@ class ProcessSupervisor:
                 if arg != "--dangerously-skip-permissions":
                     cmd.append(arg)
 
+        circuit_breaker = self.circuit_breaker
+        # Enforce cooldown if circuit breaker is already OPEN
+        if circuit_breaker.is_open():
+            rem = circuit_breaker.get_remaining_cooldown()
+            if rem > 0:
+                sys.stdout.write(f"\r\n\033[1;31m[!] THRESHOLD BREAKER ACTIVE: {circuit_breaker.trip_reason}\033[0m\r\n")
+                sys.stdout.write(f"\033[1;33m[*] Mandatory cooldown active: waiting {rem:.1f}s before attempting session...\033[0m\r\n")
+                sys.stdout.flush()
+                time.sleep(rem)
+
         quota_detected = threading.Event()
         quota_reset_secs = [0]
+        quota_is_daily = [True]
+        captured_event = [None]
         stop_watcher = threading.Event()
 
-        def log_watcher(proc: subprocess.Popen):
-            tracked_file = None
-            tracked_pos = 0
-            line_buffer = b""
+        # Defect 1 Fix: Sample tracked_file and tracked_pos BEFORE Popen to eliminate startup TOCTOU race
+        symlink = CLI_DIR / "cli.log"
+        tracked_file = None
+        tracked_pos = 0
+        if symlink.exists():
+            try:
+                resolved = symlink.resolve()
+                if resolved.exists():
+                    tracked_file = resolved
+                    tracked_pos = resolved.stat().st_size
+            except OSError:
+                pass
 
-            symlink = CLI_DIR / "cli.log"
-            if symlink.exists():
-                try:
-                    resolved = symlink.resolve()
-                    if resolved.exists():
-                        tracked_file = resolved
-                        tracked_pos = resolved.stat().st_size
-                except OSError:
-                    pass
+        line_buffer = [b""]
+        drain_lock = threading.Lock()
 
-            while not stop_watcher.is_set() and proc.poll() is None:
-                try:
-                    if symlink.exists():
+        def read_and_classify() -> bool:
+            """
+            Drains newly appended log bytes from tracked_file and classifies events.
+            Returns True if a terminating event (Notice, Auth Failure, Quota Exhausted) is detected.
+            """
+            nonlocal tracked_file, tracked_pos
+            with drain_lock:
+                if symlink.exists():
+                    try:
                         resolved = symlink.resolve()
                         if tracked_file is None or resolved != tracked_file:
                             tracked_file = resolved
                             tracked_pos = 0
-                            line_buffer = b""
+                            line_buffer[0] = b""
+                    except OSError:
+                        pass
 
-                    if tracked_file and tracked_file.exists():
+                if tracked_file and tracked_file.exists():
+                    try:
                         cur_size = tracked_file.stat().st_size
                         if cur_size < tracked_pos:
                             tracked_pos = 0
-                            line_buffer = b""
+                            line_buffer[0] = b""
 
                         if cur_size > tracked_pos:
                             with open(tracked_file, "rb") as lf:
@@ -605,41 +2923,44 @@ class ProcessSupervisor:
                                 new_bytes = lf.read(cur_size - tracked_pos)
                                 tracked_pos = cur_size
 
-                                content = line_buffer + new_bytes
+                                content = line_buffer[0] + new_bytes
                                 lines = content.split(b"\n")
-                                line_buffer = lines.pop()
+                                line_buffer[0] = lines.pop()
 
-                                for line in lines:
-                                    if is_genuine_quota_log(line):
+                                if lines:
+                                    for raw_l in lines:
+                                        ev = classify_log_event(raw_l)
+                                        if ev.event_type != LogEventType.NONE and not ev.is_transient:
+                                            tripped = circuit_breaker.record_event(ev)
+                                            if tripped:
+                                                if hasattr(self.account_mgr, "save_state"):
+                                                    self.account_mgr.save_state()
+                                                captured_event[0] = ev
+                                                quota_detected.set()
+                                                quota_reset_secs[0] = int(circuit_breaker.get_remaining_cooldown())
+                                                quota_is_daily[0] = ev.is_daily or (circuit_breaker.strike_count >= 2)
+                                                return True
+
+                                    event = resolve_chunk_event(lines)
+                                    if event:
+                                        captured_event[0] = event
                                         quota_detected.set()
-                                        try:
-                                            text = line.decode("utf-8", errors="ignore")
-                                            quota_reset_secs[0] = parse_reset_seconds(text)
-                                        except Exception:
-                                            pass
-                                        # Escalate termination in watcher to prevent proc.wait() deadlock
-                                        try:
-                                            proc.send_signal(signal.SIGINT)
-                                            for _ in range(25):
-                                                if proc.poll() is not None:
-                                                    break
-                                                time.sleep(0.1)
-                                            else:
-                                                proc.terminate()
-                                                for _ in range(10):
-                                                    if proc.poll() is not None:
-                                                        break
-                                                    time.sleep(0.1)
-                                                else:
-                                                    proc.kill()
-                                        except OSError:
-                                            pass
-                                        break
-                                if quota_detected.is_set():
-                                    break
-                except Exception:
-                    pass
-                time.sleep(0.05)
+                                        quota_reset_secs[0] = event.reset_seconds
+                                        quota_is_daily[0] = event.is_daily
+                                        return True
+                    except Exception:
+                        pass
+                return False
+
+        def log_watcher(proc: subprocess.Popen):
+            while not stop_watcher.is_set() and proc.poll() is None:
+                if read_and_classify():
+                    try:
+                        kill_process_tree(proc)
+                    except Exception:
+                        pass
+                    break
+                stop_watcher.wait(0.05)
 
         # Launch agy directly in the foreground (inherits real tty stdin, stdout, stderr)
         try:
@@ -647,7 +2968,7 @@ class ProcessSupervisor:
             self.child_process = proc
         except Exception as e:
             sys.stderr.write(f"\r\n\033[1;31m[!] Lỗi khởi chạy 'agy': {e}\033[0m\r\n")
-            return False, 0
+            return SessionResult(False, 0, False, None)
 
         watcher_thread = threading.Thread(target=log_watcher, args=(proc,), daemon=True)
         watcher_thread.start()
@@ -660,20 +2981,57 @@ class ProcessSupervisor:
                 pass
             sys.exit(0)
 
-        old_sigterm = signal.signal(signal.SIGTERM, handle_term_signal)
-        old_sighup = signal.signal(signal.SIGHUP, handle_term_signal)
-        old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        old_sigterm = None
+        old_sighup = None
+        old_sigint = None
+        try:
+            old_sigterm = signal.signal(signal.SIGTERM, handle_term_signal)
+            old_sighup = signal.signal(signal.SIGHUP, handle_term_signal)
+            old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
 
         try:
             proc.wait()
         finally:
-            signal.signal(signal.SIGINT, old_sigint)
-            signal.signal(signal.SIGTERM, old_sigterm)
-            signal.signal(signal.SIGHUP, old_sighup)
+            try:
+                if old_sigint is not None:
+                    signal.signal(signal.SIGINT, old_sigint)
+                if old_sigterm is not None:
+                    signal.signal(signal.SIGTERM, old_sigterm)
+                if old_sighup is not None:
+                    signal.signal(signal.SIGHUP, old_sighup)
+            except (ValueError, OSError):
+                pass
             stop_watcher.set()
-            watcher_thread.join(timeout=0.5)
 
-        return quota_detected.is_set(), quota_reset_secs[0]
+            # Defect 2 Fix: Mandatory post-proc.wait() drain pass before joining watcher thread
+            # Catches fast-exiting child processes emitting notices or auth errors immediately before exit
+            if not quota_detected.is_set():
+                read_and_classify()
+                with drain_lock:
+                    if not quota_detected.is_set() and line_buffer[0].strip():
+                        trailing_event = classify_log_event(line_buffer[0])
+                        if trailing_event.should_terminate:
+                            captured_event[0] = trailing_event
+                            quota_detected.set()
+                            quota_reset_secs[0] = trailing_event.reset_seconds
+                            quota_is_daily[0] = trailing_event.is_daily
+
+            watcher_thread.join(timeout=3.0)
+
+        # Record ownership of active conversation
+        latest = self.get_latest_conversation()
+        if latest:
+            self.account_mgr.set_conversation_owner(latest, curr_slot)
+
+        self.last_event = captured_event[0]
+        return SessionResult(
+            quota_detected.is_set(),
+            quota_reset_secs[0],
+            quota_is_daily[0],
+            captured_event[0],
+        )
 
 PTYSupervisor = ProcessSupervisor
 
@@ -690,11 +3048,14 @@ def cmd_status(mgr: AccountManager):
     print(f"Active Slot: Slot {curr} (Tổng số tài khoản đã nạp: {len(all_slots)})\n")
     print(f"{'Slot':<6} {'Email':<32} {'Status':<18} {'Reset Info'}")
     print("-" * 70)
+    state_modified = False
     for i in all_slots:
         s_str = str(i)
         slot_dir = mgr.accounts_dir / s_str
-        email = extract_email_from_path(slot_dir)
-        info = mgr.state.get("slots", {}).get(s_str, {})
+        email = extract_email_from_path(slot_dir) or "Unknown"
+        info = (mgr.state.get("slots") or {}).get(s_str)
+        if not isinstance(info, dict):
+            info = {}
         status = info.get("status", "ACTIVE")
         until = info.get("exhausted_until", 0)
         
@@ -702,19 +3063,148 @@ def cmd_status(mgr: AccountManager):
         if status == "EXHAUSTED_DAILY" and until > now:
             rem = until - now
             reset_str = f"{rem // 3600}h {(rem % 3600) // 60}m (00:05 PST)"
+        elif status == "COOLDOWN_RPM" and until > now:
+            rem = until - now
+            reset_str = f"{rem}s (RPM Cooldown)"
+        elif until <= now and status in ["EXHAUSTED_DAILY", "COOLDOWN_RPM"]:
+            status = "ACTIVE"
+            slots_map = mgr.state.get("slots")
+            if isinstance(slots_map, dict) and s_str in slots_map:
+                if not isinstance(slots_map[s_str], dict):
+                    slots_map[s_str] = {}
+                slots_map[s_str]["status"] = "ACTIVE"
+                slots_map[s_str]["exhausted_until"] = 0
+                state_modified = True
         elif not (slot_dir / "oauth_creds.json").exists() and not (slot_dir / "keyring_secret.json").exists():
             status = "NOT_CONFIGURED"
             email = "[Chưa cấu hình]"
         
         marker = "-> " if s_str == curr else "   "
         print(f"{marker}{s_str:<4} {email:<32} {status:<18} {reset_str}")
+    if state_modified:
+        mgr.save_state()
     print("=" * 70)
     print("💡 Thêm tài khoản mới: agy-supervisor add")
     print("💡 Reset cooldown tất cả: agy-supervisor reset")
+    print("💡 Kiểm tra kết nối & token: agy-supervisor probe")
+
+def cmd_probe(mgr: AccountManager, target_slot: str = "all", live_probe: bool = True):
+    """Performs non-destructive health check, token verification, and live cloud probe."""
+    print("=" * 75)
+    print("  ANTIGRAVITY MULTI-ACCOUNT SUPERVISOR - LIVE MULTI-SLOT CLOUD PROBE")
+    print("=" * 75)
+    all_slots = [str(s) for s in mgr.get_all_slots()]
+    if target_slot not in ["all", "--all"] and str(target_slot) in all_slots:
+        selected_slots = [int(target_slot)]
+    else:
+        selected_slots = [int(s) for s in all_slots]
+
+    try:
+        curr_slot = int(mgr.get_current_slot())
+    except Exception:
+        curr_slot = 1
+
+    prober = SlotHealthProber(mgr.accounts_dir, is_active_slot_fn=lambda s: s == curr_slot)
+    now = int(time.time())
+
+    for s in selected_slots:
+        s_str = str(s)
+        slot_dir = mgr.accounts_dir / s_str
+        is_active = (s == curr_slot)
+        marker = "-> " if is_active else "   "
+
+        # 1. File checks
+        oauth_file = slot_dir / "oauth_creds.json"
+        keyring_file = slot_dir / "keyring_secret.json"
+        has_oauth = oauth_file.exists()
+        has_keyring = keyring_file.exists()
+
+        if not has_oauth and not has_keyring:
+            email = extract_email_from_path(slot_dir)
+            print(f"\n{marker}Slot {s_str} [{email}] {'(CURRENT ACTIVE)' if is_active else ''}")
+            print("    [!] Chưa cấu hình credentials cho slot này.")
+            continue
+
+        creds = prober._extract_slot_credentials(s)
+        email = creds["email"]
+
+        # Run non-destructive probe
+        res = prober.probe_slot(s, live_probe=live_probe)
+
+        # Format Status Badge
+        if res.status == SlotStatusType.HEALTHY:
+            badge = "\033[1;32m[HEALTHY]\033[0m"
+        elif res.status == SlotStatusType.QUOTA_EXHAUSTED:
+            badge = f"\033[1;33m[QUOTA_EXHAUSTED (Resets in {res.reset_seconds // 3600}h {(res.reset_seconds % 3600) // 60}m)]\033[0m"
+        elif res.status == SlotStatusType.NOTICE_SUSPENDED:
+            badge = "\033[1;31m[NOTICE_SUSPENDED]\033[0m"
+        elif res.status == SlotStatusType.TOKEN_REVOKED:
+            badge = "\033[1;31m[TOKEN_REVOKED]\033[0m"
+        elif res.status == SlotStatusType.CLIENT_ID_MISMATCH:
+            app_name = res.audience_report.app_name if res.audience_report and res.audience_report.app_name else "gemini-cli"
+            badge = f"\033[1;35m[CLIENT_ID_MISMATCH ({app_name})]\033[0m"
+        else:
+            badge = f"\033[1;31m[{res.status.value}]\033[0m"
+
+        print(f"\n{marker}Slot {s_str} [{email}] {'(CURRENT ACTIVE)' if is_active else ''} {badge}")
+        print(f"    - Storage: Keyring Backup={'YES' if has_keyring else 'NO'}, OAuth File={'YES' if has_oauth else 'NO'}")
+
+        # Refresh token presence check
+        has_rt = bool(creds.get("refresh_token"))
+        print(f"    - Refresh Token: {'AVAILABLE (Auto-renewable)' if has_rt else 'MISSING'}")
+
+        # Access token expiration details
+        access_tok = creds.get("access_token")
+        is_exp = creds.get("is_expired")
+        if access_tok and not is_exp:
+            exp_info = "Valid (Active)"
+        elif has_rt:
+            exp_info = "Access token expired (auto-refresh via refresh_token)"
+        else:
+            exp_info = "Missing or Expired"
+        print(f"    - Access Token State: {exp_info}")
+
+        # Audience / Client ID Report
+        aud_rep = res.audience_report
+        if aud_rep:
+            aud_str = f"{aud_rep.status.value} ({aud_rep.app_name})"
+            print(f"    - Audience / Client ID: {aud_str}")
+
+        # Token Refresh & Expiry Details
+        print(f"    - Live Token Refresh: {'Refreshed & Validated' if res.token_refreshed else ('Valid (Cached)' if not is_exp else 'Refresh Failed')}")
+        print(f"    - CloudCode Backend Status: {res.details}")
+        print(f"    - Quota Levels: Gemini Quota={int(res.gemini_remaining * 100)}% | 3P Models (Claude/GPT)={int(res.third_party_remaining * 100)}%")
+
+        # Quota State in Supervisor
+        info = (mgr.state.get("slots") or {}).get(s_str)
+        if not isinstance(info, dict):
+            info = {}
+        status = info.get("status", "ACTIVE")
+        until = info.get("exhausted_until", 0)
+        if status == "EXHAUSTED_DAILY" and until > now:
+            rem = until - now
+            print(f"    - Supervisor Quota Status: EXHAUSTED_DAILY (Resets in {rem // 3600}h {(rem % 3600) // 60}m)")
+        elif status == "COOLDOWN_RPM" and until > now:
+            rem = until - now
+            print(f"    - Supervisor Quota Status: COOLDOWN_RPM (Resets in {rem}s)")
+        else:
+            print(f"    - Supervisor Quota Status: ACTIVE (Ready)")
+
+        if res.status == SlotStatusType.CLIENT_ID_MISMATCH:
+            print(f"    - \033[1;36mAction Required: Chạy 'agy-supervisor login {s_str}' để cấu hình token Antigravity hợp lệ.\033[0m")
+
+        # Sync ground-truth result back into supervisor state
+        mgr.sync_probe_result(res)
+
+    print("\n" + "=" * 75)
 
 def cmd_reset(mgr: AccountManager, target_slot: str = "all"):
     """Resets exhaustion cooldown for one or all slots."""
-    if "slots" not in mgr.state:
+    mgr.reset_failovers()
+    mgr.rotation_timestamps.clear()
+    if hasattr(mgr, "circuit_breaker") and mgr.circuit_breaker:
+        mgr.circuit_breaker.reset()
+    if "slots" not in mgr.state or not isinstance(mgr.state.get("slots"), dict):
         mgr.state["slots"] = {}
 
     all_slots = mgr.get_all_slots()
@@ -722,6 +3212,8 @@ def cmd_reset(mgr: AccountManager, target_slot: str = "all"):
         for s in all_slots:
             s_str = str(s)
             if s_str in mgr.state["slots"]:
+                if not isinstance(mgr.state["slots"][s_str], dict):
+                    mgr.state["slots"][s_str] = {}
                 mgr.state["slots"][s_str]["status"] = "ACTIVE"
                 mgr.state["slots"][s_str]["exhausted_until"] = 0
         mgr.save_state()
@@ -729,6 +3221,8 @@ def cmd_reset(mgr: AccountManager, target_slot: str = "all"):
     else:
         s_str = str(target_slot)
         if s_str in mgr.state["slots"]:
+            if not isinstance(mgr.state["slots"][s_str], dict):
+                mgr.state["slots"][s_str] = {}
             mgr.state["slots"][s_str]["status"] = "ACTIVE"
             mgr.state["slots"][s_str]["exhausted_until"] = 0
             mgr.save_state()
@@ -741,12 +3235,18 @@ def cmd_switch(mgr: AccountManager, target_slot: str):
     if not target_slot.isdigit() or int(target_slot) < 1:
         print("Sử dụng: agy-supervisor switch <số thứ tự slot, vd: 1, 2, 3, 4...>")
         sys.exit(1)
-    mgr.sync_back_current()
     target_dir = mgr.accounts_dir / target_slot
     if not (target_dir / "oauth_creds.json").exists() and not (target_dir / "keyring_secret.json").exists():
         print(f"[!] Lỗi: Slot {target_slot} chưa có dữ liệu. Chạy 'agy-supervisor login {target_slot}' trước.")
         sys.exit(1)
-    mgr.apply_slot(target_slot)
+
+    # Sync back current active tokens before switching (guarded against quarantined current slot)
+    mgr.sync_back_current()
+
+    if not mgr.apply_slot(target_slot):
+        print(f"\r\n\033[1;31m[-] Chuyển sang Slot {target_slot} thất bại do vi phạm Credential Guard hoặc dữ liệu không hợp lệ.\033[0m")
+        sys.exit(1)
+
     email = extract_email_from_path(target_dir)
     print(f"[+] Đã chuyển sang Slot {target_slot}: {email}")
 
@@ -777,8 +3277,12 @@ def cmd_login(mgr: AccountManager, target_slot: str):
     mgr.sync_back_current()
 
     # Backup current active to a temp location
-    tmp_backup = Path("/tmp") / f"gemini_auth_backup_{int(time.time())}"
+    tmp_backup = Path(tempfile.gettempdir()) / f"gemini_auth_backup_{int(time.time())}"
     tmp_backup.mkdir(exist_ok=True)
+    try:
+        os.chmod(tmp_backup, 0o700)
+    except OSError:
+        pass
     for fname in ["oauth_creds.json", "google_accounts.json"]:
         src = GEMINI_DIR / fname
         if src.exists():
@@ -809,6 +3313,15 @@ def cmd_login(mgr: AccountManager, target_slot: str):
     if new_oauth.exists() or new_keyring:
         slot_dir = mgr.accounts_dir / target_slot
         slot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clear stale credentials in slot_dir if not re-created by agy
+        # (On Linux with Secret Service, agy saves fresh tokens to GNOME Keyring instead of file)
+        if not new_oauth.exists() and (slot_dir / "oauth_creds.json").exists():
+            try:
+                (slot_dir / "oauth_creds.json").unlink()
+            except OSError:
+                pass
+
         for fname in ["oauth_creds.json", "google_accounts.json"]:
             src = GEMINI_DIR / fname
             if src.exists():
@@ -818,8 +3331,24 @@ def cmd_login(mgr: AccountManager, target_slot: str):
             with open(slot_dir / "keyring_secret.json", "w") as f:
                 f.write(new_keyring)
 
+        # Auto-refresh and generate clean Antigravity oauth_creds.json from fresh keyring token
+        if not (slot_dir / "oauth_creds.json").exists() and new_keyring:
+            try:
+                prober = SlotHealthProber(mgr.accounts_dir)
+                creds = prober._extract_slot_credentials(int(target_slot))
+                if creds.get("refresh_token"):
+                    prober.refresh_slot_token(int(target_slot), creds)
+            except Exception:
+                pass
+
         email = extract_email_from_path(slot_dir)
         mgr.apply_slot(target_slot)
+        if str(target_slot) in mgr.state.get("slots", {}):
+            mgr.state["slots"][str(target_slot)]["status"] = "ACTIVE"
+            mgr.state["slots"][str(target_slot)]["exhausted_until"] = 0
+            mgr.state["slots"][str(target_slot)].pop("reason", None)
+            mgr.state["slots"][str(target_slot)].pop("suspension_reason", None)
+            mgr.save_state()
         print(f"\n\033[1;32m[+] Thành công: Đã cấu hình và lưu Slot {target_slot}: {email}\033[0m\n")
     else:
         print("\n\033[1;31m[-] Không tìm thấy token mới. Đang khôi phục tài khoản trước đó...\033[0m")
@@ -891,6 +3420,10 @@ def main():
             target = sys.argv[2] if len(sys.argv) > 2 else "all"
             cmd_reset(mgr, target)
             return
+        elif first_arg == "probe":
+            target = sys.argv[2] if len(sys.argv) > 2 else "all"
+            cmd_probe(mgr, target)
+            return
         elif first_arg == "setup":
             cmd_setup(mgr)
             return
@@ -899,6 +3432,7 @@ def main():
             print("\nSử dụng:")
             print("  agy-supervisor [args...]       Khởi chạy agy với auto-failover & --dangerously-skip-permissions")
             print("  agy-supervisor status          Xem danh sách tất cả các slot tài khoản & trạng thái quota")
+            print("  agy-supervisor probe [N|all]   Kiểm tra sức khỏe token, thời hạn & kết nối cloud của các slot")
             print("  agy-supervisor reset [N|all]   Reset trạng thái cooldown quota của các slot về ACTIVE")
             print("  agy-supervisor add             Tự động tạo Slot N+1 và mở trình duyệt để nạp thêm tài khoản")
             print("  agy-supervisor login <N>       Đăng nhập hoặc nạp lại tài khoản cho Slot N (vd: login 4, login 5...)")
@@ -910,23 +3444,57 @@ def main():
     # Default runner: start supervisor session
     user_args = sys.argv[1:]
     curr_slot = mgr.get_current_slot()
-    mgr.apply_slot(curr_slot)
 
-    is_continue = False
+    if not mgr.apply_slot(curr_slot):
+        sys.stdout.write(f"\r\n\033[1;33m[*] Slot hiện tại ({curr_slot}) không thể kích hoạt do vi phạm Credential Guard hoặc dữ liệu không hợp lệ.\033[0m\r\n")
+        sys.stdout.write(f"\033[1;33m[*] Đang tự động tìm kiếm và kích hoạt tài khoản an toàn tiếp theo...\033[0m\r\n")
+        sys.stdout.flush()
+
+        next_slot = mgr.rotate_to_next()
+        if not next_slot:
+            sys.stdout.write("\r\n\033[1;31m[!] Không có tài khoản khả dụng hoặc an toàn để khởi động agy.\033[0m\r\n")
+            sys.stdout.write("\033[1;36m💡 Chạy 'agy-supervisor status' để kiểm tra hoặc 'agy-supervisor login <slot>' để cấp quyền lại.\033[0m\r\n\r\n")
+            sys.stdout.flush()
+            sys.exit(1)
+        curr_slot = next_slot
+        email_curr = extract_email_from_path(mgr.accounts_dir / curr_slot)
+        sys.stdout.write(f"\033[1;32m[+] Đã tự động kích hoạt Slot {curr_slot} ({email_curr}). Khởi động phiên làm việc...\033[0m\r\n")
+        sys.stdout.flush()
+
+    is_continue = any(arg in sys.argv[1:] for arg in ("-c", "--continue"))
 
     with TerminalGuard() as guard:
         while True:
             supervisor = ProcessSupervisor(mgr)
-            quota_hit, reset_secs = supervisor.run_session(user_args, is_continue=is_continue)
+            res = supervisor.run_session(user_args, is_continue=is_continue)
+            quota_hit, reset_secs, is_daily = res[0], res[1], res[2]
+            event = getattr(res, "event", None) or getattr(supervisor, "last_event", None)
 
             if quota_hit:
                 # FIRST: Restore normal terminal buffer so circuit breaker and switch messages are visible
                 guard.restore()
                 curr_slot = mgr.get_current_slot()
-                mgr.mark_exhausted(curr_slot, reset_secs=reset_secs)
                 email_curr = extract_email_from_path(mgr.accounts_dir / curr_slot)
-                sys.stdout.write(f"\r\n\033[1;33m[!] Hết quota ở Slot {curr_slot} ({email_curr}). Đang kiểm tra xoay tua...\033[0m\r\n")
-                sys.stdout.flush()
+
+                if event and event.event_type in (LogEventType.ACCOUNT_NOTICE, "EVENT_ACCOUNT_NOTICE", "ACCOUNT_NOTICE"):
+                    mgr.mark_slot_failed(curr_slot, event)
+                    sys.stdout.write(f"\r\n\033[1;31m[!] CẢNH BÁO NGUY HIỂM: Phát hiện tài khoản Slot {curr_slot} ({email_curr}) bị Google NOTICE / Khóa vi phạm điều khoản!\033[0m\r\n")
+                    sys.stdout.write(f"\033[1;31m    Lý do: {event.reason}\033[0m\r\n")
+                    sys.stdout.write(f"\033[1;33m[*] Đang cô lập Slot {curr_slot} và tự động chuyển ngay sang tài khoản khả dụng tiếp theo...\033[0m\r\n")
+                    sys.stdout.flush()
+                elif event and event.event_type in (LogEventType.AUTH_FAILURE, "EVENT_AUTH_FAILURE", "AUTH_FAILURE"):
+                    mgr.mark_slot_failed(curr_slot, event)
+                    sys.stdout.write(f"\r\n\033[1;31m[!] CẢNH BÁO: Slot {curr_slot} ({email_curr}) bị lỗi xác thực ({event.reason})!\033[0m\r\n")
+                    sys.stdout.write(f"\033[1;33m[*] Đang chuyển sang tài khoản khả dụng tiếp theo...\033[0m\r\n")
+                    sys.stdout.flush()
+                else:
+                    if event:
+                        mgr.mark_slot_failed(curr_slot, event)
+                    else:
+                        mgr.mark_exhausted(curr_slot, reset_secs=reset_secs, is_daily=is_daily)
+                    status_label = "hết quota ngày" if is_daily else "chạm giới hạn tốc độ (RPM)"
+                    sys.stdout.write(f"\r\n\033[1;33m[!] Slot {curr_slot} ({email_curr}) {status_label}. Đang kiểm tra xoay tua...\033[0m\r\n")
+                    sys.stdout.flush()
 
                 next_slot = mgr.rotate_to_next()
                 if not next_slot:
@@ -938,7 +3506,11 @@ def main():
                 is_continue = True
                 continue
             else:
+                mgr.reset_failovers()
                 mgr.sync_back_current()
+                if hasattr(mgr, "circuit_breaker") and mgr.circuit_breaker:
+                    mgr.circuit_breaker.reset()
+                    mgr.save_state()
                 break
 
 if __name__ == "__main__":
